@@ -171,7 +171,8 @@ export class MapView {
       },
       center: [139.7, 35.7], // Tokyo
       zoom: 5,
-      antialias: true
+      antialias: true,
+      dragRotate: false
     });
 
     // Add navigation control
