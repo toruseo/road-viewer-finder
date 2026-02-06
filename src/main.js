@@ -5,7 +5,7 @@
 import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE } from './MapView.js';
 import pako from 'pako';
 import { marked } from 'marked';
-import helpMd from './help.md?raw';
+import helpMd from '../README.md?raw';
 
 class App {
   constructor() {
