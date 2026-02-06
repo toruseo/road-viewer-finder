@@ -1,6 +1,6 @@
-# OSM-road-viewer
+# 道路閲覧検索アプリ/road-viewer-finder
 
-公開ページ：https://toruseo.jp/OSM-road-viewer/
+公開ページ：https://toruseo.jp/road-viewer-finder/
 
 日本の主要道路を簡単に閲覧・検索するためのWebアプリ
 
@@ -33,7 +33,7 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 
 ## 開発者向け情報
 
-詳細は[Github](https://github.com/toruseo/OSM-road-viewer)の[CLAUDE.md](https://github.com/toruseo/OSM-road-viewer/blob/main/CLAUDE.md)を参照してください．
+詳細は[Github](https://github.com/toruseo/road-viewer-finder)の[CLAUDE.md](https://github.com/toruseo/road-viewer-finder/blob/main/CLAUDE.md)を参照してください．
 
 ## クレジット・ライセンス
 

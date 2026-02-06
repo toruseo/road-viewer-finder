@@ -1,5 +1,5 @@
 {
-  "name": "osm-road-viewer",
+  "name": "road-viewer-finder",
   "version": "1.0.0",
   "description": "Large-scale GeoJSON WebGL rendering application",
   "type": "module",

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-OSM-road-viewer is a web app for viewing and searching Japanese OSM road data. It renders large GeoJSON (~200MB) via WebGL using deck.gl on top of MapLibre GL JS. Deployed to GitHub Pages at https://toruseo.jp/OSM-road-viewer/.
+road-viewer-finder is a web app for viewing and searching Japanese OSM road data. It renders large GeoJSON (~200MB) via WebGL using deck.gl on top of MapLibre GL JS. Deployed to GitHub Pages at https://toruseo.jp/road-viewer-finder/.
 
 ## Commands
 
