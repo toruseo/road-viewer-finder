@@ -9,8 +9,8 @@ import { MapboxOverlay } from '@deck.gl/mapbox';
 export const ROAD_STYLES = {
   motorway:  { color: [220, 50, 50, 255],  width: 6 },  // Red, thickest
   trunk:     { color: [50, 100, 220, 255], width: 4 },  // Blue
-  primary:   { color: [25, 90, 50, 255], width: 2 },  // Green
-  secondary: { color: [25, 90, 50, 255], width: 1 },  // Green, thinnest
+  primary:   { color: [25, 90, 50, 255], width: 3 },  // Green
+  secondary: { color: [25, 90, 50, 255], width: 2 },  // Green, thinnest
 };
 export const DEFAULT_ROAD_STYLE = { color: [128, 128, 128, 255], width: 1 };
 
@@ -41,13 +41,18 @@ function sortByZOrder(geojson) {
   };
 }
 
-/**
- * Calculate midpoint and angle for a LineString
- */
-function getLineMidpoint(coordinates) {
-  if (!coordinates || coordinates.length < 2) return null;
+// Interval for placing label candidates along a line (in degrees, ~5km)
+const LABEL_CANDIDATE_INTERVAL = 0.05;
 
-  // Find the midpoint along the line
+/**
+ * Generate evenly-spaced label points along a LineString.
+ * Short lines get one point at the midpoint.
+ * Long lines get multiple points at regular intervals.
+ * Returns an array of { position, angle }.
+ */
+function getLinePoints(coordinates) {
+  if (!coordinates || coordinates.length < 2) return [];
+
   let totalLength = 0;
   const segments = [];
 
@@ -59,48 +64,61 @@ function getLineMidpoint(coordinates) {
     totalLength += length;
   }
 
-  // Find the segment containing the midpoint
-  const halfLength = totalLength / 2;
-  let accumulated = 0;
+  if (totalLength === 0) return [];
 
-  for (const seg of segments) {
-    if (accumulated + seg.length >= halfLength) {
-      // Interpolate within this segment
-      const ratio = (halfLength - accumulated) / seg.length;
-      const x = seg.start[0] + (seg.end[0] - seg.start[0]) * ratio;
-      const y = seg.start[1] + (seg.end[1] - seg.start[1]) * ratio;
+  // Determine how many points to place
+  const numPoints = Math.max(1, Math.round(totalLength / LABEL_CANDIDATE_INTERVAL));
+  const spacing = totalLength / (numPoints + 1);
 
-      // Calculate angle in degrees (for text rotation)
-      const dx = seg.end[0] - seg.start[0];
-      const dy = seg.end[1] - seg.start[1];
-      let angle = Math.atan2(dy, dx) * (180 / Math.PI);
+  const points = [];
 
-      // Keep text readable (not upside down)
-      if (angle > 90) angle -= 180;
-      if (angle < -90) angle += 180;
+  for (let p = 1; p <= numPoints; p++) {
+    const targetDist = spacing * p;
+    let accumulated = 0;
 
-      return { position: [x, y], angle };
+    for (const seg of segments) {
+      if (accumulated + seg.length >= targetDist) {
+        const ratio = (targetDist - accumulated) / seg.length;
+        const x = seg.start[0] + (seg.end[0] - seg.start[0]) * ratio;
+        const y = seg.start[1] + (seg.end[1] - seg.start[1]) * ratio;
+
+        const dx = seg.end[0] - seg.start[0];
+        const dy = seg.end[1] - seg.start[1];
+        let angle = Math.atan2(dy, dx) * (180 / Math.PI);
+
+        if (angle > 90) angle -= 180;
+        if (angle < -90) angle += 180;
+
+        points.push({ position: [x, y], angle });
+        break;
+      }
+      accumulated += seg.length;
     }
-    accumulated += seg.length;
   }
 
-  return null;
+  return points;
 }
 
-// Label sampling interval (show 1 label per N features with same name)
-const LABEL_SAMPLE_INTERVAL = 10;
+// Road importance for label priority (higher = more important, labeled first)
+const LABEL_PRIORITY = {
+  motorway: 5,
+  trunk: 4,
+  primary: 3,
+  secondary: 2,
+};
+const DEFAULT_LABEL_PRIORITY = 1;
+
+// Minimum spacing between labels in screen pixels
+const LABEL_MIN_SPACING_PX = 150;
 
 /**
- * Generate label data from GeoJSON features
- * - Deduplicates labels with the same name
- * - Samples labels at regular intervals for repeated road segments
+ * Generate all label candidates from GeoJSON features (no spatial filtering).
+ * Sorted by road importance so higher-priority roads get labels first.
  */
-function generateLabels(geojson) {
+function generateCandidates(geojson) {
   if (!geojson?.features) return [];
 
-  const labels = [];
-  const nameCount = new Map(); // Track how many times each name has appeared
-  const usedNames = new Set(); // Track which names have been added
+  const candidates = [];
 
   for (const feature of geojson.features) {
     const name = feature.properties?.name;
@@ -109,49 +127,37 @@ function generateLabels(geojson) {
     const geometry = feature.geometry;
     if (!geometry) continue;
 
-    // Count occurrences of this name
-    const count = (nameCount.get(name) || 0) + 1;
-    nameCount.set(name, count);
-
-    // Only add label at first occurrence or at regular intervals
-    // This ensures we get one label early, then additional ones spaced out
-    const shouldAdd = count === 1 || (count % LABEL_SAMPLE_INTERVAL === 0);
-
-    if (!shouldAdd) continue;
-
-    let midpoint = null;
+    let points = [];
 
     if (geometry.type === 'LineString') {
-      midpoint = getLineMidpoint(geometry.coordinates);
+      points = getLinePoints(geometry.coordinates);
     } else if (geometry.type === 'MultiLineString') {
-      // Use the longest segment for MultiLineString
-      let longestCoords = geometry.coordinates[0];
-      let maxLen = 0;
       for (const coords of geometry.coordinates) {
-        if (coords.length > maxLen) {
-          maxLen = coords.length;
-          longestCoords = coords;
-        }
+        points.push(...getLinePoints(coords));
       }
-      midpoint = getLineMidpoint(longestCoords);
     }
 
-    if (midpoint) {
-      const fclass = feature.properties?.fclass || '';
-      const ref = feature.properties?.ref || '';
-      labels.push({
+    const fclass = feature.properties?.fclass || '';
+    const ref = feature.properties?.ref || '';
+    const priority = LABEL_PRIORITY[fclass] || DEFAULT_LABEL_PRIORITY;
+
+    for (const pt of points) {
+      candidates.push({
         name,
-        position: midpoint.position,
-        angle: midpoint.angle,
+        position: pt.position,
+        angle: pt.angle,
         fclass,
         ref,
-        label: [name, fclass, ref].filter(Boolean).join(' ')
+        label: name,
+        priority
       });
     }
   }
 
-  console.log(`Label stats: ${nameCount.size} unique names, ${labels.length} labels generated`);
-  return labels;
+  candidates.sort((a, b) => b.priority - a.priority);
+
+  console.log(`Label candidates: ${candidates.length}`);
+  return candidates;
 }
 
 export class MapView {
@@ -161,9 +167,11 @@ export class MapView {
     this.deckOverlay = null;
     this.currentData = null;
     this.showLabels = false;
-    this.labelsData = [];
+    this.labelCandidates = [];  // All label candidates (pre-computed)
+    this.labelsData = [];       // Currently visible labels (filtered by viewport)
     this.tooltip = null;
     this.highlightData = null;
+    this._onMoveEnd = null;
   }
 
   /**
@@ -221,6 +229,15 @@ export class MapView {
     // Get tooltip element
     this.tooltip = document.getElementById('tooltip');
 
+    // Re-filter labels on viewport change
+    this._onMoveEnd = () => {
+      if (this.showLabels && this.labelCandidates.length > 0) {
+        this.labelsData = this.filterLabelsForViewport();
+        this.updateLayers();
+      }
+    };
+    this.map.on('moveend', this._onMoveEnd);
+
     console.log('MapView initialized with deck.gl overlay');
   }
 
@@ -232,7 +249,8 @@ export class MapView {
     console.log('setData called with', geojson?.features?.length || 0, 'features');
     // Sort by z-order so motorway (red) is drawn on top
     this.currentData = sortByZOrder(geojson);
-    this.labelsData = []; // Clear cached labels
+    this.labelCandidates = [];
+    this.labelsData = [];
     this.updateLayers();
 
     // Fit bounds to data if available
@@ -288,30 +306,37 @@ export class MapView {
 
     // Add labels if enabled
     if (this.showLabels) {
-      // Generate labels only if not cached
+      // Generate candidates only if not cached
+      if (this.labelCandidates.length === 0) {
+        this.labelCandidates = generateCandidates(this.currentData);
+      }
+      // Filter by viewport pixels if not already done
       if (this.labelsData.length === 0) {
-        this.labelsData = generateLabels(this.currentData);
-        console.log(`Generated ${this.labelsData.length} labels`);
+        this.labelsData = this.filterLabelsForViewport();
       }
 
+      const labelSize = 14;
       const textLayer = new TextLayer({
         id: 'road-labels',
         data: this.labelsData,
         getPosition: d => d.position,
         getText: d => d.label,
         getAngle: d => d.angle,
-        getSize: 12,
+        getSize: labelSize,
         getColor: [0, 0, 0, 255],
         getTextAnchor: 'middle',
         getAlignmentBaseline: 'center',
+        getPixelOffset: d => {
+          const rad = d.angle * Math.PI / 180;
+          return [-labelSize*0.9 * Math.sin(rad), -labelSize*0.9 * Math.cos(rad)];
+        },
         fontFamily: '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif',
         fontWeight: 'bold',
-        outlineWidth: 2,
-        outlineColor: [255, 255, 255, 255],
+        outlineWidth: 0,
         billboard: false,
         sizeUnits: 'pixels',
-        sizeMinPixels: 10,
-        sizeMaxPixels: 16,
+        sizeMinPixels: 12,
+        sizeMaxPixels: 18,
         pickable: false,
         characterSet: 'auto'
       });
@@ -347,7 +372,59 @@ export class MapView {
    */
   setLabelsVisible(visible) {
     this.showLabels = visible;
+    this.labelsData = []; // Reset filtered labels so they get recalculated
     this.updateLayers();
+  }
+
+  /**
+   * Filter label candidates by screen-pixel spacing.
+   * Projects each candidate to screen coordinates and uses a grid to ensure
+   * no two labels are closer than LABEL_MIN_SPACING_PX pixels.
+   */
+  filterLabelsForViewport() {
+    if (!this.labelCandidates.length || !this.map) return [];
+
+    const bounds = this.map.getBounds();
+    const padding = 0.01;
+    const west = bounds.getWest() - padding;
+    const east = bounds.getEast() + padding;
+    const south = bounds.getSouth() - padding;
+    const north = bounds.getNorth() + padding;
+
+    const cellSize = LABEL_MIN_SPACING_PX;
+    const occupied = new Map();
+    const labels = [];
+
+    for (const candidate of this.labelCandidates) {
+      const [lng, lat] = candidate.position;
+
+      // Skip candidates outside the viewport
+      if (lng < west || lng > east || lat < south || lat > north) continue;
+
+      // Project geographic coordinates to screen pixels
+      const pixel = this.map.project([lng, lat]);
+      const cellX = Math.floor(pixel.x / cellSize);
+      const cellY = Math.floor(pixel.y / cellSize);
+
+      // Check 3x3 neighborhood for already-placed labels
+      let tooClose = false;
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          if (occupied.has(`${cellX + dx},${cellY + dy}`)) {
+            tooClose = true;
+            break;
+          }
+        }
+        if (tooClose) break;
+      }
+
+      if (!tooClose) {
+        labels.push(candidate);
+        occupied.set(`${cellX},${cellY}`, true);
+      }
+    }
+
+    return labels;
   }
 
   /**
@@ -510,6 +587,9 @@ export class MapView {
    * Clean up resources
    */
   dispose() {
+    if (this._onMoveEnd && this.map) {
+      this.map.off('moveend', this._onMoveEnd);
+    }
     if (this.deckOverlay) {
       this.map.removeControl(this.deckOverlay);
     }
