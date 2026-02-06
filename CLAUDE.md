@@ -13,7 +13,7 @@ OSM-road-viewer is a web app for viewing and searching Japanese OSM road data. I
 - `npm run build` - Production build to `dist/`
 - `npm run preview` - Preview production build
 
-No test framework or linter is configured.
+No test framework or linter is configured. ユーザが `npm run dev` を常時実行しているため、Claude側で `npm run build` による確認は不要。
 
 ## Frameworks
 

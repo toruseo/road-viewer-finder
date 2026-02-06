@@ -2,7 +2,7 @@
  * Main Application Entry Point
  * Large-scale GeoJSON WebGL Rendering Application
  */
-import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE } from './MapView.js';
+import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE, LOD_LAYERS } from './MapView.js';
 import pako from 'pako';
 import { marked } from 'marked';
 import helpMd from '../README.md?raw';
@@ -27,6 +27,15 @@ class App {
     const showLabelsCheckbox = document.getElementById('show-labels');
     showLabelsCheckbox.addEventListener('change', (e) => {
       this.mapView.setLabelsVisible(e.target.checked);
+    });
+
+    // Toggle LOD override
+    document.getElementById('show-all-roads').addEventListener('change', (e) => {
+      this.mapView.forceAllVisible = e.target.checked;
+      this.mapView.labelsData = [];
+      this.mapView._visibleTierFlags = null;
+      this.mapView.updateLayers();
+      if (this._updateLegendOpacity) this._updateLegendOpacity();
     });
 
     // Setup search
@@ -56,9 +65,15 @@ class App {
   }
 
   /**
-   * Setup legend styles from ROAD_STYLES
+   * Setup legend styles from ROAD_STYLES and LOD zoom-based opacity
    */
   setupLegend() {
+    // Build fclass -> minZoom lookup from LOD_LAYERS
+    const fclassMinZoom = {};
+    for (const layer of LOD_LAYERS) {
+      if (layer.fclass) fclassMinZoom[layer.fclass] = layer.minZoom;
+    }
+
     const legendItems = document.querySelectorAll('#legend .legend-item');
     legendItems.forEach(item => {
       const fclass = item.dataset.fclass;
@@ -70,6 +85,19 @@ class App {
         line.style.background = `rgb(${r}, ${g}, ${b})`;
       }
     });
+
+    // Update legend opacity on zoom changes
+    this._updateLegendOpacity = () => {
+      const zoom = this.mapView.getMap().getZoom();
+      legendItems.forEach(item => {
+        const fclass = item.dataset.fclass;
+        const minZoom = fclassMinZoom[fclass] ?? 12;
+        item.style.opacity = (this.mapView.forceAllVisible || zoom >= minZoom) ? '1' : '0.3';
+      });
+    };
+
+    this.mapView.getMap().on('zoom', this._updateLegendOpacity);
+    this._updateLegendOpacity();
   }
 
   /**

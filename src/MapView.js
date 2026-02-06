@@ -23,6 +23,22 @@ const Z_ORDER = {
 };
 const DEFAULT_Z_ORDER = 0;
 
+// --- LOD zoom thresholds (adjust here) ---
+const LOD_ZOOM_MOTORWAY  = 0;   // 常時表示
+const LOD_ZOOM_TRUNK     = 0;   // 常時表示
+const LOD_ZOOM_PRIMARY   = 8;
+const LOD_ZOOM_SECONDARY = 10;
+const LOD_ZOOM_OTHER     = 12;
+
+// LOD layer definitions: array order = draw order (first = bottom, last = top)
+export const LOD_LAYERS = [
+  { id: 'road-other',     fclass: null,        minZoom: LOD_ZOOM_OTHER,     ...DEFAULT_ROAD_STYLE },
+  { id: 'road-secondary', fclass: 'secondary', minZoom: LOD_ZOOM_SECONDARY, ...ROAD_STYLES.secondary },
+  { id: 'road-primary',   fclass: 'primary',   minZoom: LOD_ZOOM_PRIMARY,   ...ROAD_STYLES.primary },
+  { id: 'road-trunk',     fclass: 'trunk',     minZoom: LOD_ZOOM_TRUNK,     ...ROAD_STYLES.trunk },
+  { id: 'road-motorway',  fclass: 'motorway',  minZoom: LOD_ZOOM_MOTORWAY,  ...ROAD_STYLES.motorway },
+];
+
 /**
  * Sort features by z-order (lower z-order drawn first, higher on top)
  */
@@ -167,12 +183,18 @@ export class MapView {
     this.deckOverlay = null;
     this.currentData = null;
     this.showLabels = true;
+    this.forceAllVisible = false;
     this.labelCandidates = [];      // All label candidates (pre-computed)
     this.highlightCandidates = [];  // Label candidates for highlighted roads (priority)
     this.labelsData = [];           // Currently visible labels (filtered by viewport)
     this.tooltip = null;
     this.highlightData = null;
+    this.tierDataMap = [];             // [{id, minZoom, color, width, geojson}]
+    this._visibleTierFlags = null;     // Previous visibility state for change detection
+    this._fclassMinZoom = {};          // fclass -> minZoom lookup for label filtering
+    this._defaultMinZoom = 12;         // Default minZoom for unlisted fclass
     this._onMoveEnd = null;
+    this._onZoom = null;
     this._lastClickTime = 0;
     this._lastClickFeature = null;
     this.onFeatureDoubleClick = null;  // callback(properties)
@@ -245,6 +267,17 @@ export class MapView {
     };
     this.map.on('moveend', this._onMoveEnd);
 
+    // Update layer visibility when zoom crosses tier thresholds
+    this._onZoom = () => {
+      const zoom = this.map.getZoom();
+      const newFlags = this.tierDataMap.map(t => zoom >= t.minZoom);
+      if (this._visibleTierFlags &&
+          newFlags.every((f, i) => f === this._visibleTierFlags[i])) return;
+      this._visibleTierFlags = newFlags;
+      this.updateLayers();
+    };
+    this.map.on('zoom', this._onZoom);
+
     console.log('MapView initialized with deck.gl overlay');
   }
 
@@ -258,6 +291,38 @@ export class MapView {
     this.currentData = sortByZOrder(geojson);
     this.labelCandidates = [];
     this.labelsData = [];
+
+    // Distribute features into LOD tier buckets
+    const buckets = LOD_LAYERS.map(() => []);
+    const fclassToTier = {};
+    LOD_LAYERS.forEach((layer, i) => {
+      if (layer.fclass) fclassToTier[layer.fclass] = i;
+    });
+    const otherTierIndex = LOD_LAYERS.findIndex(l => l.fclass === null);
+
+    if (this.currentData?.features) {
+      for (const feature of this.currentData.features) {
+        const fclass = feature.properties?.fclass;
+        const tierIndex = fclassToTier[fclass] ?? otherTierIndex;
+        buckets[tierIndex].push(feature);
+      }
+    }
+
+    this.tierDataMap = LOD_LAYERS.map((layer, i) => ({
+      id: layer.id,
+      minZoom: layer.minZoom,
+      color: layer.color,
+      width: layer.width,
+      geojson: { type: 'FeatureCollection', features: buckets[i] },
+    }));
+
+    // Build fclass -> minZoom lookup for label filtering
+    this._fclassMinZoom = {};
+    for (const layer of LOD_LAYERS) {
+      if (layer.fclass) this._fclassMinZoom[layer.fclass] = layer.minZoom;
+    }
+
+    this._visibleTierFlags = null;
     this.updateLayers();
 
     // Fit bounds to data if available
@@ -275,42 +340,33 @@ export class MapView {
       return;
     }
 
-    console.log('Creating GeoJsonLayer...');
+    const zoom = this.map.getZoom();
+    const hasHighlight = this.highlightData?.features?.length > 0;
+    const allVisible = this.forceAllVisible || hasHighlight;
 
-    const geojsonLayer = new GeoJsonLayer({
-      id: 'geojson-layer',
-      data: this.currentData,
-      // Line styling
-      stroked: true,
-      filled: true,
-      lineWidthUnits: 'pixels',
-      lineWidthMinPixels: 1,
-      lineWidthMaxPixels: 20,
-      getLineWidth: f => {
-        const fclass = f.properties?.fclass;
-        return (ROAD_STYLES[fclass] || DEFAULT_ROAD_STYLE).width;
-      },
-      getLineColor: f => {
-        const fclass = f.properties?.fclass;
-        return (ROAD_STYLES[fclass] || DEFAULT_ROAD_STYLE).color;
-      },
-      // Polygon styling
-      getFillColor: [66, 133, 244, 50],
-      // Point styling
-      pointType: 'circle',
-      getPointRadius: 5,
-      pointRadiusUnits: 'pixels',
-      // Interaction
-      pickable: true,
-      onHover: (info) => this.handleHover(info),
-      onClick: (info) => this.handleClick(info),
-      updateTriggers: {
-        getLineColor: [this.currentData],
-        getLineWidth: [this.currentData]
-      }
-    });
+    const roadLayers = this.tierDataMap.map(tier =>
+      new GeoJsonLayer({
+        id: tier.id,
+        data: tier.geojson,
+        visible: allVisible || zoom >= tier.minZoom,
+        stroked: true,
+        filled: true,
+        lineWidthUnits: 'pixels',
+        lineWidthMinPixels: 1,
+        lineWidthMaxPixels: 20,
+        getLineWidth: tier.width,
+        getLineColor: tier.color,
+        getFillColor: [66, 133, 244, 50],
+        pointType: 'circle',
+        getPointRadius: 5,
+        pointRadiusUnits: 'pixels',
+        pickable: true,
+        onHover: (info) => this.handleHover(info),
+        onClick: (info) => this.handleClick(info),
+      })
+    );
 
-    const layers = [geojsonLayer];
+    const layers = [...roadLayers];
 
     // Add labels if enabled
     if (this.showLabels) {
@@ -408,7 +464,15 @@ export class MapView {
       ? [...this.highlightCandidates, ...this.labelCandidates]
       : this.labelCandidates;
 
+    const zoom = this.map.getZoom();
+
     for (const candidate of allCandidates) {
+      // Skip labels for roads hidden by LOD
+      if (!this.forceAllVisible) {
+        const minZoom = this._fclassMinZoom[candidate.fclass] ?? this._defaultMinZoom;
+        if (zoom < minZoom) continue;
+      }
+
       const [lng, lat] = candidate.position;
 
       // Skip candidates outside the viewport
@@ -609,6 +673,7 @@ export class MapView {
    */
   clearData() {
     this.currentData = [];
+    this.tierDataMap = [];
     this.deckOverlay.setProps({
       layers: []
     });
@@ -626,6 +691,9 @@ export class MapView {
    * Clean up resources
    */
   dispose() {
+    if (this._onZoom && this.map) {
+      this.map.off('zoom', this._onZoom);
+    }
     if (this._onMoveEnd && this.map) {
       this.map.off('moveend', this._onMoveEnd);
     }
