@@ -1,60 +1,49 @@
-# GeoJSON Viewer
+# CLAUDE.md
 
-大規模GeoJSON（百MBクラス）をWebGLで高速描画するローカルWebアプリ
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## 技術スタック
-- **描画**: deck.gl (GeoJsonLayer, TextLayer) + MapLibre GL JS
-- **ビルド**: Vite
+## Overview
 
-## プロジェクト構造
-```
-gis/
-├── index.html              # エントリポイント（UI、スタイル）
-├── package.json            # 依存関係
-├── vite.config.js          # Vite設定
-├── osm.geojson             # 道路データ（起動時に自動読み込み）
-└── src/
-    ├── main.js             # アプリケーションエントリ、検索UI連携
-    └── MapView.js          # deck.gl + MapLibre統合、描画・検索機能
-```
+OSM-road-viewer is a web app for viewing and searching Japanese OSM road data. It renders large GeoJSON (~200MB) via WebGL using deck.gl on top of MapLibre GL JS. Deployed to GitHub Pages at https://toruseo.jp/OSM-road-viewer/.
 
-## 実装済み機能
+## Commands
 
-### 1. 基本機能
-- osm.geojson自動読み込み（進捗表示付き）
-- 自動bounds調整（データ範囲にフィット）
+- `npm install` - Install dependencies
+- `npm run dev` - Start Vite dev server (http://localhost:5173, auto-opens browser)
+- `npm run build` - Production build to `dist/`
+- `npm run preview` - Preview production build
 
-### 2. OSM道路スタイリング
-fclass属性に基づく色分けと線幅設定：
+No test framework or linter is configured.
 
-| fclass    | 色   | 線幅 |
-|-----------|------|------|
-| motorway  | 赤   | 6px  |
-| trunk     | 青   | 4px  |
-| primary   | 緑   | 2px  |
-| secondary | 緑   | 1px  |
-| その他    | グレー | 1px  |
+## Frameworks
 
-### 3. 道路名ラベル表示
-- チェックボックスでオン/オフ切替（デフォルト: オフ）
-- 表示形式: `name fclass ref`
-- 同名道路の重複ラベル抑制（10セグメントごとに1つ）
-- 日本語フォント対応
+- **Build**: Vite
+- **Render**: deck.gl (GeoJsonLayer, TextLayer) + MapLibre GL JS
 
-### 4. ホバー時ツールチップ
-- 道路にマウスを置くと道路名をポップアップ表示
-- 表示形式: `name fclass ref`
+## Architecture
 
-### 5. 道路検索機能
-- 検索条件: name（部分一致）, fclass（プルダウン選択）, ref（完全一致）
-- AND検索（空欄は無視）
-- ヒットした道路を黄色でハイライト表示
-- 検索結果の範囲に自動ジャンプ
-- 検索結果件数表示
+The app has two source files with clear responsibilities:
 
-## 起動方法
-```bash
-npm install
-npm run dev
-```
-http://localhost:5173 でアクセス
+- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), GeoJSON loading with streaming progress and gzip decompression (pako). Loads `public/osm.geojson.gz` on startup. Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
+- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with three layers: `GeoJsonLayer` (roads), `TextLayer` (labels), and a highlight `GeoJsonLayer` (search results in yellow). Handles viewport-based label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
+
+**`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal, progress bar). Styles are inline in `<style>`, not in separate CSS files.
+
+## Key Data Flow
+
+1. `App.loadGeoJSON()` fetches and decompresses `public/osm.geojson.gz` (detects gzip magic bytes since dev server may auto-decompress)
+2. `MapView.setData()` sorts features by z-order (motorway on top) and renders
+3. Labels are generated as point candidates along LineStrings at ~0.05 degree intervals, then filtered per viewport using screen-pixel grid spacing (150px minimum)
+4. Search filters features in-memory and highlights matches with a separate yellow GeoJsonLayer
+
+## Road Styling
+
+Road styles are defined in `ROAD_STYLES` and `Z_ORDER` constants in MapView.js. The `fclass` property from OSM data drives both color/width and draw order. Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
+
+## Deployment
+
+GitHub Actions (`.github/workflows/deploy.yml`) auto-deploys to GitHub Pages on push to `main`. Vite is configured with `base: './'` for relative paths. The GeoJSON data file lives in `public/` as gzip-compressed `osm.geojson.gz`.
+
+## Language
+
+UI text and comments are in Japanese. The app targets Japanese road data and uses Japanese font stacks for labels.
