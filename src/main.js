@@ -32,6 +32,17 @@ class App {
     // Setup search
     this.setupSearch();
 
+    // Double-click on road: search by fclass + ref
+    this.mapView.onFeatureDoubleClick = (props) => {
+      const fclassInput = document.getElementById('search-fclass');
+      const refInput = document.getElementById('search-ref');
+      const nameInput = document.getElementById('search-name');
+      nameInput.value = '';
+      fclassInput.value = props?.fclass || '';
+      refInput.value = props?.ref || '';
+      document.getElementById('search-btn').click();
+    };
+
     // Setup help modal
     this.setupHelp();
 

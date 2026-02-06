@@ -173,6 +173,9 @@ export class MapView {
     this.tooltip = null;
     this.highlightData = null;
     this._onMoveEnd = null;
+    this._lastClickTime = 0;
+    this._lastClickFeature = null;
+    this.onFeatureDoubleClick = null;  // callback(properties)
   }
 
   /**
@@ -300,6 +303,7 @@ export class MapView {
       // Interaction
       pickable: true,
       onHover: (info) => this.handleHover(info),
+      onClick: (info) => this.handleClick(info),
       updateTriggers: {
         getLineColor: [this.currentData],
         getLineWidth: [this.currentData]
@@ -434,6 +438,26 @@ export class MapView {
     }
 
     return labels;
+  }
+
+  /**
+   * Handle click events for double-click detection
+   */
+  handleClick(info) {
+    if (!info.object) return;
+
+    const now = Date.now();
+    if (now - this._lastClickTime < 400 && this._lastClickFeature === info.object) {
+      // Double click detected
+      if (this.onFeatureDoubleClick) {
+        this.onFeatureDoubleClick(info.object.properties);
+      }
+      this._lastClickTime = 0;
+      this._lastClickFeature = null;
+    } else {
+      this._lastClickTime = now;
+      this._lastClickFeature = info.object;
+    }
   }
 
   /**
