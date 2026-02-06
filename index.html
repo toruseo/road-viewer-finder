@@ -339,9 +339,16 @@
     .legend-item {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       margin-bottom: 4px;
       transition: opacity 0.3s ease;
+    }
+
+    .legend-item input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      cursor: pointer;
     }
 
     .legend-item:last-child {
@@ -361,18 +368,22 @@
 <div id="legend">
     <h4>道路種別</h4>
     <div class="legend-item" data-fclass="motorway">
+      <input type="checkbox" checked>
       <div class="legend-line"></div>
       <span>高速道路等 (motorway)</span>
     </div>
     <div class="legend-item" data-fclass="trunk">
+      <input type="checkbox" checked>
       <div class="legend-line"></div>
       <span>国道等 (trunk)</span>
     </div>
     <div class="legend-item" data-fclass="primary">
+      <input type="checkbox" checked>
       <div class="legend-line"></div>
       <span>主要地方道等 (primary)</span>
     </div>
     <div class="legend-item" data-fclass="secondary">
+      <input type="checkbox" checked>
       <div class="legend-line"></div>
       <span>一般県道等 (secondary)</span>
     </div>
@@ -421,10 +432,6 @@
       <label>
         <input type="checkbox" id="show-labels" checked>
         道路名を表示
-      </label>
-      <label>
-        <input type="checkbox" id="show-all-roads">
-        全道路を常に表示
       </label>
     </div>
   </div>

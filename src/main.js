@@ -2,7 +2,7 @@
  * Main Application Entry Point
  * Large-scale GeoJSON WebGL Rendering Application
  */
-import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE, LOD_LAYERS } from './MapView.js';
+import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE } from './MapView.js';
 import pako from 'pako';
 import { marked } from 'marked';
 import helpMd from '../README.md?raw';
@@ -32,19 +32,6 @@ class App {
       this.mapView.setLabelsVisible(e.target.checked);
     });
 
-    // Toggle LOD override
-    const showAllRoadsCheckbox = document.getElementById('show-all-roads');
-    showAllRoadsCheckbox.checked = localStorage.getItem('show-all-roads') === 'true';
-    this.mapView.forceAllVisible = showAllRoadsCheckbox.checked;
-    showAllRoadsCheckbox.addEventListener('change', (e) => {
-      localStorage.setItem('show-all-roads', e.target.checked);
-      this.mapView.forceAllVisible = e.target.checked;
-      this.mapView.labelsData = [];
-      this.mapView._visibleTierFlags = null;
-      this.mapView.updateLayers();
-      if (this._updateLegendOpacity) this._updateLegendOpacity();
-    });
-
     // Setup search
     this.setupSearch();
 
@@ -72,15 +59,9 @@ class App {
   }
 
   /**
-   * Setup legend styles from ROAD_STYLES and LOD zoom-based opacity
+   * Setup legend styles and visibility checkboxes
    */
   setupLegend() {
-    // Build fclass -> minZoom lookup from LOD_LAYERS
-    const fclassMinZoom = {};
-    for (const layer of LOD_LAYERS) {
-      if (layer.fclass) fclassMinZoom[layer.fclass] = layer.minZoom;
-    }
-
     const legendItems = document.querySelectorAll('#legend .legend-item');
     legendItems.forEach(item => {
       const fclass = item.dataset.fclass;
@@ -91,20 +72,28 @@ class App {
         line.style.height = `${style.width}px`;
         line.style.background = `rgb(${r}, ${g}, ${b})`;
       }
-    });
 
-    // Update legend opacity on zoom changes
-    this._updateLegendOpacity = () => {
-      const zoom = this.mapView.getMap().getZoom();
-      legendItems.forEach(item => {
-        const fclass = item.dataset.fclass;
-        const minZoom = fclassMinZoom[fclass] ?? 12;
-        item.style.opacity = (this.mapView.forceAllVisible || zoom >= minZoom) ? '1' : '0.3';
+      // fclass key for MapView (null for 'other')
+      const tierFclass = fclass === 'other' ? null : fclass;
+      const storageKey = `legend-${fclass}`;
+
+      const checkbox = item.querySelector('input[type="checkbox"]');
+      if (!checkbox) return;
+
+      // Restore from localStorage
+      const saved = localStorage.getItem(storageKey);
+      const visible = saved !== 'false';
+      checkbox.checked = visible;
+      item.style.opacity = visible ? '1' : '0.5';
+      if (!visible) this.mapView.setFclassVisible(tierFclass, false);
+
+      checkbox.addEventListener('change', (e) => {
+        const checked = e.target.checked;
+        localStorage.setItem(storageKey, checked);
+        item.style.opacity = checked ? '1' : '0.5';
+        this.mapView.setFclassVisible(tierFclass, checked);
       });
-    };
-
-    this.mapView.getMap().on('zoom', this._updateLegendOpacity);
-    this._updateLegendOpacity();
+    });
   }
 
   /**
