@@ -74,15 +74,10 @@ class App {
         line.style.background = `rgb(${r}, ${g}, ${b})`;
       }
 
-      const storageKey = `legend-${fclass}`;
-
       const checkbox = item.querySelector('input[type="checkbox"]');
       if (!checkbox) return;
 
-      // Restore from localStorage
-      const saved = localStorage.getItem(storageKey);
-      const visible = saved !== 'false';
-      checkbox.checked = visible;
+      const visible = checkbox.checked;
       item.style.opacity = visible ? '1' : '0.5';
       if (!visible) this.mapView.setFclassVisible(fclass, false);
 
@@ -93,7 +88,6 @@ class App {
 
       checkbox.addEventListener('change', (e) => {
         const checked = e.target.checked;
-        localStorage.setItem(storageKey, checked);
         item.style.opacity = checked ? '1' : '0.5';
         if (checked) {
           this.loadAndShowFclass(fclass);
