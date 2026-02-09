@@ -35,7 +35,7 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 
 詳細は[Github](https://github.com/toruseo/road-viewer-finder)の[CLAUDE.md](https://github.com/toruseo/road-viewer-finder/blob/main/CLAUDE.md)を参照してください．
 
-このリポジトリは日本の道路を対象にしていますが，`public/osm.geojson.gz`を別の地域のOSMデータに変更すれば他の地域でも全く同様に使えるはずです．
+このリポジトリは日本の道路を対象にしていますが，`public/osm_*.geojson.gz`を別の地域のOSMデータに変更すれば他の地域でも全く同様に使えるはずです．
 
 ## クレジット・ライセンス
 
@@ -43,7 +43,7 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 
 コード：MIT License
 
-地図データ（`public/osm.geojson.gz`）：
+地図データ（`public/osm.geojson_*.gz`）：
 (c) OpenStreetMap contributors. 
 Open Database License (ODbL) v1.0.
 https://github.com/toruseo/osm-road-extractor-simplifier により生成
