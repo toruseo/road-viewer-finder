@@ -173,16 +173,22 @@ export class MapView {
     this.containerId = containerId;
     this.map = null;
     this.deckOverlay = null;
-    this.currentData = null;
+    this.currentData = { type: 'FeatureCollection', features: [] };
     this.showLabels = true;
     this.labelCandidates = [];      // All label candidates (pre-computed)
     this.highlightCandidates = [];  // Label candidates for highlighted roads (priority)
     this.labelsData = [];           // Currently visible labels (filtered by viewport)
     this.tooltip = null;
     this.highlightData = null;
-    this.tierDataMap = [];             // [{id, fclass, color, width, geojson}]
+    this.tierDataMap = ROAD_LAYERS.map(layer => ({
+      id: layer.id,
+      fclass: layer.fclass,
+      color: layer.color,
+      width: layer.width,
+      geojson: { type: 'FeatureCollection', features: [] },
+    }));
     this._hiddenFclasses = new Set();  // Set of fclass values (null for 'other') currently hidden
-    this._knownFclasses = new Set();   // Named fclasses from ROAD_LAYERS
+    this._knownFclasses = new Set(ROAD_LAYERS.filter(l => l.fclass).map(l => l.fclass));
     this._onMoveEnd = null;
     this._lastClickTime = 0;
     this._lastClickFeature = null;
@@ -260,56 +266,34 @@ export class MapView {
   }
 
   /**
-   * Update the displayed data
-   * @param {Object} geojson - GeoJSON FeatureCollection
+   * Set data for a specific road fclass tier
+   * @param {string} fclass - fclass value (e.g. 'motorway')
+   * @param {Object} geojson - GeoJSON FeatureCollection for this fclass
    */
-  setData(geojson) {
-    console.log('setData called with', geojson?.features?.length || 0, 'features');
-    // Sort by z-order so motorway (red) is drawn on top
-    this.currentData = sortByZOrder(geojson);
-    this.labelCandidates = [];
+  setTierData(fclass, geojson) {
+    const tier = this.tierDataMap.find(t => t.fclass === fclass);
+    if (tier) {
+      tier.geojson = geojson;
+    }
+
+    this._rebuildCurrentData();
+    this.labelCandidates = generateCandidates(this.currentData);
     this.labelsData = [];
-
-    // Distribute features into tier buckets
-    const buckets = ROAD_LAYERS.map(() => []);
-    const fclassToTier = {};
-    ROAD_LAYERS.forEach((layer, i) => {
-      if (layer.fclass) fclassToTier[layer.fclass] = i;
-    });
-    if (this.currentData?.features) {
-      for (const feature of this.currentData.features) {
-        const fclass = feature.properties?.fclass;
-        const tierIndex = fclassToTier[fclass];
-        if (tierIndex !== undefined) buckets[tierIndex].push(feature);
-      }
-    }
-
-    this.tierDataMap = ROAD_LAYERS.map((layer, i) => ({
-      id: layer.id,
-      fclass: layer.fclass,
-      color: layer.color,
-      width: layer.width,
-      geojson: { type: 'FeatureCollection', features: buckets[i] },
-    }));
-
-    this._knownFclasses = new Set(ROAD_LAYERS.filter(l => l.fclass).map(l => l.fclass));
     this.updateLayers();
+  }
 
-    // Fit bounds to data if available
-    if (geojson && geojson.features && geojson.features.length > 0) {
-      this.fitToData(geojson);
-    }
+  /**
+   * Rebuild currentData from all tier data (for search, labels, etc.)
+   */
+  _rebuildCurrentData() {
+    const allFeatures = this.tierDataMap.flatMap(t => t.geojson.features);
+    this.currentData = { type: 'FeatureCollection', features: allFeatures };
   }
 
   /**
    * Update deck.gl layers
    */
   updateLayers() {
-    if (!this.currentData) {
-      this.deckOverlay.setProps({ layers: [] });
-      return;
-    }
-
     const roadLayers = this.tierDataMap.map(tier =>
       new GeoJsonLayer({
         id: tier.id,

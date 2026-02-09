@@ -10,6 +10,8 @@ import helpMd from '../README.md?raw';
 class App {
   constructor() {
     this.mapView = null;
+    this.loadedData = {};       // fclass -> geojson (キャッシュ)
+    this.loadingPromises = {};  // fclass -> Promise (重複ダウンロード防止)
   }
 
   /**
@@ -49,20 +51,19 @@ class App {
     // Setup help modal
     this.setupHelp();
 
-    // Setup legend styles
+    // Setup legend styles and start on-demand loading
     this.setupLegend();
-
-    // Load osm.geojson.gz from public folder (gzip compressed)
-    await this.loadGeoJSON(import.meta.env.BASE_URL + 'osm.geojson.gz');
 
     console.log('Application ready');
   }
 
   /**
-   * Setup legend styles and visibility checkboxes
+   * Setup legend styles and visibility checkboxes, start on-demand loading
    */
   setupLegend() {
     const legendItems = document.querySelectorAll('#legend .legend-item');
+    const initialLoads = [];
+
     legendItems.forEach(item => {
       const fclass = item.dataset.fclass;
       const style = ROAD_STYLES[fclass] || DEFAULT_ROAD_STYLE;
@@ -73,8 +74,6 @@ class App {
         line.style.background = `rgb(${r}, ${g}, ${b})`;
       }
 
-      // fclass key for MapView (null for 'other')
-      const tierFclass = fclass === 'other' ? null : fclass;
       const storageKey = `legend-${fclass}`;
 
       const checkbox = item.querySelector('input[type="checkbox"]');
@@ -85,15 +84,27 @@ class App {
       const visible = saved !== 'false';
       checkbox.checked = visible;
       item.style.opacity = visible ? '1' : '0.5';
-      if (!visible) this.mapView.setFclassVisible(tierFclass, false);
+      if (!visible) this.mapView.setFclassVisible(fclass, false);
+
+      // Queue initial download for checked items
+      if (visible) {
+        initialLoads.push(this.loadAndShowFclass(fclass));
+      }
 
       checkbox.addEventListener('change', (e) => {
         const checked = e.target.checked;
         localStorage.setItem(storageKey, checked);
         item.style.opacity = checked ? '1' : '0.5';
-        this.mapView.setFclassVisible(tierFclass, checked);
+        if (checked) {
+          this.loadAndShowFclass(fclass);
+        } else {
+          this.mapView.setFclassVisible(fclass, false);
+        }
       });
     });
+
+    // Wait for all initial loads in parallel (non-blocking for UI)
+    Promise.all(initialLoads).catch(console.error);
   }
 
   /**
@@ -181,80 +192,82 @@ class App {
   }
 
   /**
-   * Load GeoJSON from URL (supports .gz gzip-compressed files)
+   * Load and show a specific fclass tier. Uses cache if already loaded.
+   * @param {string} fclass - e.g. 'motorway', 'trunk', 'primary', 'secondary'
    */
-  async loadGeoJSON(url) {
-    const progressText = document.getElementById('progress-text');
-    const progressContainer = document.getElementById('progress-container');
-    const progressFill = document.getElementById('progress-fill');
-    const isGzipped = url.endsWith('.gz');
+  async loadAndShowFclass(fclass) {
+    // Already cached → just show
+    if (this.loadedData[fclass]) {
+      this.mapView.setFclassVisible(fclass, true);
+      return;
+    }
+    // Already downloading → wait for existing promise
+    if (this.loadingPromises[fclass]) {
+      await this.loadingPromises[fclass];
+      this.mapView.setFclassVisible(fclass, true);
+      return;
+    }
+
+    const statusEl = document.querySelector(`.legend-item[data-fclass="${fclass}"] .legend-status`);
+    if (statusEl) statusEl.textContent = '読み込み中...';
 
     try {
-      progressContainer.style.display = 'block';
-      progressText.textContent = '読み込み中...';
-      progressFill.style.width = '0%';
+      this.loadingPromises[fclass] = this._fetchFclassData(fclass);
+      const geojson = await this.loadingPromises[fclass];
+      delete this.loadingPromises[fclass];
 
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
-      }
+      this.loadedData[fclass] = geojson;
+      if (statusEl) statusEl.textContent = '';
 
-      const contentLength = response.headers.get('content-length');
-      const total = contentLength ? parseInt(contentLength, 10) : 0;
-
-      // Stream reading with progress
-      const reader = response.body.getReader();
-      const chunks = [];
-      let received = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        chunks.push(value);
-        received += value.length;
-
-        if (total > 0) {
-          const progress = Math.round((received / total) * 100);
-          progressFill.style.width = `${progress}%`;
-        }
-        progressText.textContent = `読み込み中... ${(received / 1024 / 1024).toFixed(1)}MB`;
-      }
-
-      // Combine chunks into single buffer
-      const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-      const combined = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const chunk of chunks) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      let geojson;
-      // Check if data is actually gzipped (magic number: 0x1f 0x8b)
-      // Note: Some servers (Vite dev, CDNs) auto-decompress gzip files
-      const isActuallyGzipped = combined[0] === 0x1f && combined[1] === 0x8b;
-
-      if (isActuallyGzipped) {
-        progressText.textContent = '解凍中...';
-        const decompressed = pako.ungzip(combined, { to: 'string' });
-        progressText.textContent = 'パース中...';
-        geojson = JSON.parse(decompressed);
-      } else {
-        progressText.textContent = 'パース中...';
-        const text = new TextDecoder().decode(combined);
-        geojson = JSON.parse(text);
-      }
-
-      progressContainer.style.display = 'none';
-      document.getElementById('search-panel').style.display = 'block';
-      document.getElementById('options').style.display = 'block';
-
-      console.log(`Loaded ${geojson?.features?.length || 0} features`);
-      this.mapView.setData(geojson);
+      console.log(`Loaded ${fclass}: ${geojson?.features?.length || 0} features`);
+      this.mapView.setTierData(fclass, geojson);
+      this.mapView.setFclassVisible(fclass, true);
     } catch (error) {
-      console.error('Error loading GeoJSON:', error);
-      progressText.textContent = `エラー: ${error.message}`;
+      delete this.loadingPromises[fclass];
+      console.error(`Error loading ${fclass}:`, error);
+      if (statusEl) statusEl.textContent = 'エラー';
+    }
+  }
+
+  /**
+   * Fetch and decompress a per-fclass GeoJSON file
+   * @param {string} fclass
+   * @returns {Promise<Object>} parsed GeoJSON
+   */
+  async _fetchFclassData(fclass) {
+    const url = import.meta.env.BASE_URL + 'osm_' + fclass + '.geojson.gz';
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} for ${fclass}`);
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+    }
+
+    // Combine chunks
+    const combined = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    // Detect gzip and decompress if needed
+    const isActuallyGzipped = combined[0] === 0x1f && combined[1] === 0x8b;
+    if (isActuallyGzipped) {
+      const decompressed = pako.ungzip(combined, { to: 'string' });
+      return JSON.parse(decompressed);
+    } else {
+      const text = new TextDecoder().decode(combined);
+      return JSON.parse(text);
     }
   }
 }
