@@ -591,8 +591,9 @@ export class MapView {
       if (fclassTrim && props.fclass !== fclassTrim) return false;
       if (refTrim) {
         // ref may contain multiple values separated by ';'
-        const refs = (props.ref || '').split(';').map(r => r.trim());
-        if (!refs.includes(refTrim)) return false;
+        const refLower = refTrim.toLowerCase();
+        const refs = (props.ref || '').split(';').map(r => r.trim().toLowerCase());
+        if (!refs.includes(refLower)) return false;
       }
       return true;
     });
