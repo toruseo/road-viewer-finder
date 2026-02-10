@@ -6,7 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:all": "vitest run && playwright test"
   },
   "dependencies": {
     "@deck.gl/core": "^9.0.0",
@@ -17,6 +21,8 @@
     "pako": "^2.1.0"
   },
   "devDependencies": {
-    "vite": "^5.0.0"
+    "@playwright/test": "^1.58.2",
+    "vite": "^5.0.0",
+    "vitest": "^4.0.18"
   }
 }

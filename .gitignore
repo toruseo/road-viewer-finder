@@ -91,6 +91,9 @@ lerna-debug.log
 Thumbs.db
 nul
 
+playwright-report/
+test-results/
+
 .claude/
 *.code-workspace
 vite.config.*.timestamp-*.mjs
