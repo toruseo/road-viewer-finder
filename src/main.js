@@ -78,7 +78,6 @@ class App {
       if (!checkbox) return;
 
       const visible = checkbox.checked;
-      item.style.opacity = visible ? '1' : '0.5';
       if (!visible) this.mapView.setFclassVisible(fclass, false);
 
       // Queue initial download for checked items
@@ -88,7 +87,6 @@ class App {
 
       checkbox.addEventListener('change', (e) => {
         const checked = e.target.checked;
-        item.style.opacity = checked ? '1' : '0.5';
         if (checked) {
           this.loadAndShowFclass(fclass);
         } else {
