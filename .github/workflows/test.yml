@@ -14,7 +14,13 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npm test
+      - run: npm install --save-dev @vitest/coverage-v8
+      - run: npx vitest run --coverage --coverage.reporter=lcov --coverage.include=src/**
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/lcov.info
+          fail_ci_if_error: false
 
   e2e-tests:
     runs-on: ubuntu-latest
