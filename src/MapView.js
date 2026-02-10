@@ -654,37 +654,4 @@ export class MapView {
     this.updateLayers();
   }
 
-  /**
-   * Clear all data from the map
-   */
-  clearData() {
-    this.currentData = [];
-    this.tierDataMap = [];
-    this.deckOverlay.setProps({
-      layers: []
-    });
-  }
-
-  /**
-   * Get the map instance
-   * @returns {maplibregl.Map}
-   */
-  getMap() {
-    return this.map;
-  }
-
-  /**
-   * Clean up resources
-   */
-  dispose() {
-    if (this._onMoveEnd && this.map) {
-      this.map.off('moveend', this._onMoveEnd);
-    }
-    if (this.deckOverlay) {
-      this.map.removeControl(this.deckOverlay);
-    }
-    if (this.map) {
-      this.map.remove();
-    }
-  }
 }

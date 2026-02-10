@@ -27,9 +27,7 @@ The app has two active source files with clear responsibilities:
 - **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass GeoJSON loading with gzip decompression (pako). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
 - **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with per-tier `GeoJsonLayer`s (roads), a `TextLayer` (labels), and a highlight `GeoJsonLayer` (search results in yellow). Handles viewport-based label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
 
-**`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal, progress bar). Styles are inline in `<style>`, not in separate CSS files.
-
-**Unused files**: `src/FileLoader.js` and `src/worker/parser.worker.js` exist but are not integrated into the app.
+**`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal). Styles are inline in `<style>`, not in separate CSS files.
 
 ## Key Data Flow
 
