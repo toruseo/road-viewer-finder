@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures.js';
 
 test.describe('Legend', () => {
   test.beforeEach(async ({ page }) => {
@@ -16,7 +16,7 @@ test.describe('Legend', () => {
     // Wait for JS to apply styles
     await expect(
       page.locator('.legend-item[data-fclass="motorway"] .legend-status')
-    ).toHaveText('', { timeout: 60000 });
+    ).toHaveText('');
 
     const lines = page.locator('.legend-line');
     const count = await lines.count();
@@ -33,7 +33,7 @@ test.describe('Legend', () => {
     await checkbox.check();
 
     // Should show loading text (confirming data fetch was triggered)
-    await expect(status).toHaveText('読み込み中...', { timeout: 10000 });
+    await expect(status).toHaveText('読み込み中...');
   });
 
   test('checkbox can be toggled', async ({ page }) => {

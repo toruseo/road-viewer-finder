@@ -93,6 +93,9 @@ nul
 
 playwright-report/
 test-results/
+.nyc_output/
+coverage/
+coverage-e2e/
 
 .claude/
 *.code-workspace

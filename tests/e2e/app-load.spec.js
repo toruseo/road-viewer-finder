@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures.js';
 
 test.describe('App load', () => {
   test.beforeEach(async ({ page }) => {
@@ -23,17 +23,16 @@ test.describe('App load', () => {
   });
 
   test('maplibre canvas appears', async ({ page }) => {
-    await expect(page.locator('.maplibregl-canvas')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.maplibregl-canvas')).toBeVisible();
   });
 
   test('default checked fclasses (motorway, trunk) load data', async ({ page }) => {
-    // Wait for motorway data to finish loading (legend-status becomes empty)
     await expect(
       page.locator('.legend-item[data-fclass="motorway"] .legend-status')
-    ).toHaveText('', { timeout: 60000 });
+    ).toHaveText('');
 
     await expect(
       page.locator('.legend-item[data-fclass="trunk"] .legend-status')
-    ).toHaveText('', { timeout: 60000 });
+    ).toHaveText('');
   });
 });

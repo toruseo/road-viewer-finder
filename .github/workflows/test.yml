@@ -20,6 +20,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage/lcov.info
+          flags: unit
           fail_ci_if_error: false
 
   e2e-tests:
@@ -33,9 +34,17 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - run: npm install --save-dev vite-plugin-istanbul nyc
       - run: npx playwright install --with-deps chromium
-      - run: npm run build
+      - run: npx vite build --config vite.config.coverage.js
       - run: npm run test:e2e
+      - run: npx nyc report --reporter=lcov --report-dir=coverage-e2e
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage-e2e/lcov.info
+          flags: e2e
+          fail_ci_if_error: false
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

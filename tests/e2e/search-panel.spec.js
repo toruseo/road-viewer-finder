@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures.js';
 
 test.describe('Search panel', () => {
   test.beforeEach(async ({ page }) => {
@@ -38,7 +38,7 @@ test.describe('Search panel', () => {
     // Wait for motorway data to load first
     await expect(
       page.locator('.legend-item[data-fclass="motorway"] .legend-status')
-    ).toHaveText('', { timeout: 60000 });
+    ).toHaveText('');
 
     await page.locator('#search-name').fill('存在しない道路XXXYYY');
     await page.locator('#search-btn').click();
@@ -47,12 +47,10 @@ test.describe('Search panel', () => {
   });
 
   test('searching for existing road name shows results', async ({ page }) => {
-    test.setTimeout(120000);
-
     // Wait for motorway data to load
     await expect(
       page.locator('.legend-item[data-fclass="motorway"] .legend-status')
-    ).toHaveText('', { timeout: 90000 });
+    ).toHaveText('');
 
     // "東名" should match motorway data (東名高速道路, 新東名高速道路)
     await page.locator('#search-name').fill('東名');
