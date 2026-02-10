@@ -15,6 +15,8 @@ road-viewer-finder is a web app for viewing and searching Japanese OSM road data
 
 No test framework or linter is configured. ユーザが `npm run dev` を常時実行しているため、Claude側で `npm run build` による確認は不要。
 
+NO GIT OPERATION BY AGENT.
+
 ## Frameworks
 
 - **Build**: Vite

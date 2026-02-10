@@ -5,6 +5,14 @@ import maplibregl from 'maplibre-gl';
 import { GeoJsonLayer, TextLayer } from '@deck.gl/layers';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 
+// Display names for fclass (user-facing)
+const FCLASS_DISPLAY_NAMES = {
+  motorway: '高速道路',
+  trunk: '国道',
+  primary: '主要地方道',
+  secondary: '一般都道府県道',
+};
+
 // Road styling based on fclass attribute
 export const ROAD_STYLES = {
   motorway:  { color: [220, 50, 50, 255],  width: 6 },  // Red, thickest
@@ -520,7 +528,7 @@ export class MapView {
       const props = info.object.properties;
       const name = props?.name;
       if (name) {
-        const fclass = props?.fclass || '';
+        const fclass = FCLASS_DISPLAY_NAMES[props?.fclass] || props?.fclass || '';
         const ref = props?.ref || '';
         const extra = [fclass, ref].filter(Boolean).join(' ');
         const label = extra ? `${name} (${extra})` : name;
