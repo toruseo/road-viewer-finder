@@ -52,6 +52,9 @@ function sortByZOrder(geojson) {
 // Interval for placing label candidates along a line (in degrees, ~5km)
 const LABEL_CANDIDATE_INTERVAL = 0.05;
 
+// Minimum road length to generate labels (in meters, approximate)
+const LABEL_MIN_ROAD_LENGTH_M = 100;
+
 /**
  * Generate evenly-spaced label points along a LineString.
  * Short lines get one point at the midpoint.
@@ -73,6 +76,9 @@ function getLinePoints(coordinates) {
   }
 
   if (totalLength === 0) return [];
+
+  // 短い道路のラベルをスキップ（度→メートルの近似変換: 日本緯度帯で1°≈100km）
+  if (totalLength * 100_000 < LABEL_MIN_ROAD_LENGTH_M) return [];
 
   // Determine how many points to place
   const numPoints = Math.max(1, Math.round(totalLength / LABEL_CANDIDATE_INTERVAL));
