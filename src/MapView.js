@@ -287,7 +287,7 @@ export class MapView {
     }
 
     this._rebuildCurrentData();
-    this.labelCandidates = generateCandidates(this.currentData);
+    this.labelCandidates = this.showLabels ? generateCandidates(this.currentData) : [];
     this.labelsData = [];
     this._roadLayers = null;
     this.updateLayers();
@@ -343,6 +343,9 @@ export class MapView {
       // Generate candidates only if not cached
       if (this.labelCandidates.length === 0) {
         this.labelCandidates = generateCandidates(this.currentData);
+      }
+      if (this.highlightData?.features?.length > 0 && this.highlightCandidates.length === 0) {
+        this.highlightCandidates = generateCandidates(this.highlightData);
       }
       // Filter by viewport pixels if not already done
       if (this.labelsData.length === 0) {
@@ -633,7 +636,7 @@ export class MapView {
         type: 'FeatureCollection',
         features: features
       };
-      this.highlightCandidates = generateCandidates(this.highlightData);
+      this.highlightCandidates = this.showLabels ? generateCandidates(this.highlightData) : [];
       // Fit to highlighted features
       this.fitToData(this.highlightData);
     }
