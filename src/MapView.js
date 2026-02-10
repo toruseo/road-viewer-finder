@@ -189,6 +189,10 @@ export class MapView {
     }));
     this._hiddenFclasses = new Set();  // Set of fclass values (null for 'other') currently hidden
     this._knownFclasses = new Set(ROAD_LAYERS.filter(l => l.fclass).map(l => l.fclass));
+    this._roadLayers = null;  // キャッシュされた道路レイヤー配列
+    this._handleHover = (info) => this.handleHover(info);
+    this._handleClick = (info) => this.handleClick(info);
+    this._fillColor = [66, 133, 244, 50];
     this._onMoveEnd = null;
     this._lastClickTime = 0;
     this._lastClickFeature = null;
@@ -279,6 +283,7 @@ export class MapView {
     this._rebuildCurrentData();
     this.labelCandidates = generateCandidates(this.currentData);
     this.labelsData = [];
+    this._roadLayers = null;
     this.updateLayers();
   }
 
@@ -291,10 +296,10 @@ export class MapView {
   }
 
   /**
-   * Update deck.gl layers
+   * Build and cache road layers
    */
-  updateLayers() {
-    const roadLayers = this.tierDataMap.map(tier =>
+  _buildRoadLayers() {
+    this._roadLayers = this.tierDataMap.map(tier =>
       new GeoJsonLayer({
         id: tier.id,
         data: tier.geojson,
@@ -306,17 +311,26 @@ export class MapView {
         lineWidthMaxPixels: 20,
         getLineWidth: tier.width,
         getLineColor: tier.color,
-        getFillColor: [66, 133, 244, 50],
+        getFillColor: this._fillColor,
         pointType: 'circle',
         getPointRadius: 5,
         pointRadiusUnits: 'pixels',
         pickable: true,
-        onHover: (info) => this.handleHover(info),
-        onClick: (info) => this.handleClick(info),
+        onHover: this._handleHover,
+        onClick: this._handleClick,
       })
     );
+  }
 
-    const layers = [...roadLayers];
+  /**
+   * Update deck.gl layers
+   */
+  updateLayers() {
+    if (!this._roadLayers) {
+      this._buildRoadLayers();
+    }
+
+    const layers = [...this._roadLayers];
 
     // Add labels if enabled
     if (this.showLabels) {
@@ -402,6 +416,7 @@ export class MapView {
       this._hiddenFclasses.add(fclass);
     }
     this.labelsData = [];
+    this._roadLayers = null;
     this.updateLayers();
   }
 
