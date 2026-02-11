@@ -189,9 +189,20 @@ class App {
       });
 
       if (results.length > 0) {
-        // Build highlight filter: match any of the found names
+        // Build highlight filter using expression syntax
         const names = [...new Set(results.map(r => r.name))];
-        this.mapView.setHighlight(['in', 'name', ...names]);
+        let highlightFilter = ['in', ['get', 'name'], ['literal', names]];
+
+        // Add ref condition to avoid over-highlighting unrelated roads
+        if (refTrim) {
+          const refCondition = ['in',
+            ';' + refTrim.toLowerCase() + ';',
+            ['concat', ';', ['downcase', ['coalesce', ['get', 'ref'], '']], ';']
+          ];
+          highlightFilter = ['all', highlightFilter, refCondition];
+        }
+
+        this.mapView.setHighlight(highlightFilter);
 
         // Fit map to merged bbox of all results
         const bbox = mergeBBoxes(results.map(r => r.bbox));
