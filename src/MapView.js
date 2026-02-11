@@ -57,6 +57,79 @@ function sortByZOrder(geojson) {
   };
 }
 
+// --- Spatial grid partitioning for viewport culling ---
+const GRID_CELL_SIZE = 2; // degrees per cell (~150-220km at Japan's latitude)
+const GRID_ORIGIN_LNG = 122;
+const GRID_ORIGIN_LAT = 24;
+
+/**
+ * Compute bounding box [minLng, minLat, maxLng, maxLat] for a GeoJSON feature.
+ */
+function getFeatureBBox(feature) {
+  const geom = feature.geometry;
+  if (!geom || !geom.coordinates) return null;
+
+  let minLng = Infinity, minLat = Infinity;
+  let maxLng = -Infinity, maxLat = -Infinity;
+
+  const scan = (coords) => {
+    if (typeof coords[0] === 'number') {
+      if (coords[0] < minLng) minLng = coords[0];
+      if (coords[0] > maxLng) maxLng = coords[0];
+      if (coords[1] < minLat) minLat = coords[1];
+      if (coords[1] > maxLat) maxLat = coords[1];
+    } else {
+      for (const c of coords) scan(c);
+    }
+  };
+
+  scan(geom.coordinates);
+  if (minLng === Infinity) return null;
+  return [minLng, minLat, maxLng, maxLat];
+}
+
+/**
+ * Partition a FeatureCollection into spatial grid cells.
+ * Features spanning cell boundaries are included in all overlapping cells.
+ * @returns {Map<string, Feature[]>} cellKey -> features array
+ */
+function partitionFeaturesByGrid(geojson) {
+  const cellMap = new Map();
+
+  for (const feature of geojson.features) {
+    const bbox = getFeatureBBox(feature);
+    if (!bbox) continue;
+
+    const [minLng, minLat, maxLng, maxLat] = bbox;
+    const colMin = Math.floor((minLng - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
+    const colMax = Math.floor((maxLng - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
+    const rowMin = Math.floor((minLat - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
+    const rowMax = Math.floor((maxLat - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
+
+    for (let col = colMin; col <= colMax; col++) {
+      for (let row = rowMin; row <= rowMax; row++) {
+        const key = `${col}_${row}`;
+        if (!cellMap.has(key)) cellMap.set(key, []);
+        cellMap.get(key).push(feature);
+      }
+    }
+  }
+
+  return cellMap;
+}
+
+/**
+ * Check if two Sets contain the same elements.
+ */
+function setsEqual(a, b) {
+  if (!a || !b) return false;
+  if (a.size !== b.size) return false;
+  for (const item of a) {
+    if (!b.has(item)) return false;
+  }
+  return true;
+}
+
 // Interval for placing label candidates along a line (in degrees, ~5km)
 const LABEL_CANDIDATE_INTERVAL = 0.05;
 
@@ -200,10 +273,14 @@ export class MapView {
       color: layer.color,
       width: layer.width,
       geojson: { type: 'FeatureCollection', features: [] },
+      cellMap: new Map(),   // cellKey -> FeatureCollection (for grid-based rendering)
+      cellKeys: [],         // sorted array of cell keys with data
     }));
     this._hiddenFclasses = new Set();  // Set of fclass values (null for 'other') currently hidden
     this._knownFclasses = new Set(ROAD_LAYERS.filter(l => l.fclass).map(l => l.fclass));
+    this._visibleCells = new Set();    // cell keys currently intersecting viewport
     this._roadLayers = null;  // キャッシュされた道路レイヤー配列
+    this._moveThrottleTimer = null;
     this._handleHover = (info) => this.handleHover(info);
     this._handleClick = (info) => this.handleClick(info);
     this._fillColor = [66, 133, 244, 50];
@@ -271,14 +348,43 @@ export class MapView {
     // Get tooltip element
     this.tooltip = document.getElementById('tooltip');
 
-    // Re-filter labels on viewport change
+    // Update cell visibility and labels on viewport change
     this._onMoveEnd = () => {
+      let needUpdate = false;
+
+      // Update visible grid cells
+      const newVisibleCells = this._getVisibleCells();
+      if (!setsEqual(this._visibleCells, newVisibleCells)) {
+        this._visibleCells = newVisibleCells;
+        this._roadLayers = null;
+        needUpdate = true;
+      }
+
+      // Re-filter labels
       if (this.showLabels && this.labelCandidates.length > 0) {
         this.labelsData = this.filterLabelsForViewport();
+        needUpdate = true;
+      }
+
+      if (needUpdate) {
         this.updateLayers();
       }
     };
     this.map.on('moveend', this._onMoveEnd);
+
+    // Throttled cell visibility update during panning (prevents pop-in)
+    this.map.on('move', () => {
+      if (this._moveThrottleTimer) return;
+      this._moveThrottleTimer = setTimeout(() => {
+        this._moveThrottleTimer = null;
+        const newVisibleCells = this._getVisibleCells();
+        if (!setsEqual(this._visibleCells, newVisibleCells)) {
+          this._visibleCells = newVisibleCells;
+          this._roadLayers = null;
+          this.updateLayers();
+        }
+      }, 100);
+    });
 
     console.log('MapView initialized with deck.gl overlay');
   }
@@ -292,11 +398,23 @@ export class MapView {
     const tier = this.tierDataMap.find(t => t.fclass === fclass);
     if (tier) {
       tier.geojson = geojson;
+
+      // Partition features into spatial grid cells
+      const rawCellMap = partitionFeaturesByGrid(geojson);
+      tier.cellMap = new Map();
+      tier.cellKeys = [];
+      for (const [key, features] of rawCellMap) {
+        tier.cellMap.set(key, { type: 'FeatureCollection', features });
+        tier.cellKeys.push(key);
+      }
+      tier.cellKeys.sort();
+      console.log(`Grid partitioned ${fclass}: ${tier.cellKeys.length} cells, ${geojson.features.length} features`);
     }
 
     this._rebuildCurrentData();
     this.labelCandidates = this.showLabels ? generateCandidates(this.currentData) : [];
     this.labelsData = [];
+    this._visibleCells = this._getVisibleCells();
     this._roadLayers = null;
     this.updateLayers();
   }
@@ -310,30 +428,69 @@ export class MapView {
   }
 
   /**
-   * Build and cache road layers
+   * Compute which grid cells intersect the current viewport (with padding).
+   * @returns {Set<string>} visible cell keys
+   */
+  _getVisibleCells() {
+    if (!this.map) return new Set();
+
+    const bounds = this.map.getBounds();
+    const padding = GRID_CELL_SIZE * 0.1;
+    const west = bounds.getWest() - padding;
+    const east = bounds.getEast() + padding;
+    const south = bounds.getSouth() - padding;
+    const north = bounds.getNorth() + padding;
+
+    const colMin = Math.floor((west - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
+    const colMax = Math.floor((east - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
+    const rowMin = Math.floor((south - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
+    const rowMax = Math.floor((north - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
+
+    const visible = new Set();
+    for (let col = colMin; col <= colMax; col++) {
+      for (let row = rowMin; row <= rowMax; row++) {
+        visible.add(`${col}_${row}`);
+      }
+    }
+    return visible;
+  }
+
+  /**
+   * Build road layers: one GeoJsonLayer per tier per grid cell.
+   * Visibility is toggled per cell based on viewport intersection.
+   * Data references are preserved to avoid deck.gl re-tessellation.
    */
   _buildRoadLayers() {
-    this._roadLayers = this.tierDataMap.map(tier =>
-      new GeoJsonLayer({
-        id: tier.id,
-        data: tier.geojson,
-        visible: !this._hiddenFclasses.has(tier.fclass),
-        stroked: true,
-        filled: true,
-        lineWidthUnits: 'pixels',
-        lineWidthMinPixels: 1,
-        lineWidthMaxPixels: 20,
-        getLineWidth: tier.width,
-        getLineColor: tier.color,
-        getFillColor: this._fillColor,
-        pointType: 'circle',
-        getPointRadius: 5,
-        pointRadiusUnits: 'pixels',
-        pickable: true,
-        onHover: this._handleHover,
-        onClick: this._handleClick,
-      })
-    );
+    this._roadLayers = [];
+
+    for (const tier of this.tierDataMap) {
+      const tierHidden = this._hiddenFclasses.has(tier.fclass);
+
+      for (const cellKey of tier.cellKeys) {
+        const cellVisible = this._visibleCells.has(cellKey);
+        const visible = !tierHidden && cellVisible;
+
+        this._roadLayers.push(new GeoJsonLayer({
+          id: `${tier.id}__${cellKey}`,
+          data: tier.cellMap.get(cellKey), // same object reference for diff optimization
+          visible,
+          stroked: true,
+          filled: true,
+          lineWidthUnits: 'pixels',
+          lineWidthMinPixels: 1,
+          lineWidthMaxPixels: 20,
+          getLineWidth: tier.width,
+          getLineColor: tier.color,
+          getFillColor: this._fillColor,
+          pointType: 'circle',
+          getPointRadius: 5,
+          pointRadiusUnits: 'pixels',
+          pickable: visible,
+          onHover: this._handleHover,
+          onClick: this._handleClick,
+        }));
+      }
+    }
   }
 
   /**
