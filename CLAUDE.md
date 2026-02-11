@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-road-viewer-finder is a web app for viewing and searching Japanese OSM road data. It renders large GeoJSON (~200MB total) via WebGL using deck.gl on top of MapLibre GL JS. Deployed to GitHub Pages at https://toruseo.jp/road-viewer-finder/.
+road-viewer-finder is a web app for viewing and searching Japanese OSM road data. It renders vector tiles from a PMTiles file using MapLibre GL JS natively. Deployed to GitHub Pages at https://toruseo.jp/road-viewer-finder/.
 
 ## Commands
 
@@ -15,35 +15,45 @@ road-viewer-finder is a web app for viewing and searching Japanese OSM road data
 
 No test framework or linter is configured. ユーザが `npm run dev` を常時実行しているため、Claude側で `npm run build` による確認は不要。
 
+### Data Pipeline (offline, run manually when OSM data is updated)
+
+- `scripts/build_tiles.sh` - GeoJSON → MBTiles (tippecanoe) → PMTiles 変換。カレントディレクトリに `osm_*.geojson` が必要
+- `scripts/build_search_index.py` - GeoJSONから検索インデックス (`public/search_index.json`) を生成
+
 ## Frameworks
 
 - **Build**: Vite
-- **Render**: deck.gl (GeoJsonLayer, TextLayer) + MapLibre GL JS
+- **Render**: MapLibre GL JS (native vector tile layers) + PMTiles
 
 ## Architecture
 
 The app has two active source files with clear responsibilities:
 
-- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass GeoJSON loading with gzip decompression (pako). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
-- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with per-tier `GeoJsonLayer`s (roads), a `TextLayer` (labels), and a highlight `GeoJsonLayer` (search results in yellow). Handles viewport-based label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
+- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), search index loading, search logic. Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
+- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Registers PMTiles protocol, manages MapLibre native `line` layers (roads), `symbol` layers (labels with built-in collision detection), highlight layers (search results in yellow). Handles hover tooltips and double-click detection via `queryRenderedFeatures`.
 
 **`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal). Styles are inline in `<style>`, not in separate CSS files.
 
 ## Key Data Flow
 
-1. `App.loadAndShowFclass(fclass)` fetches and decompresses per-fclass files from `public/osm_[fclass].geojson.gz` (four files: motorway, trunk, primary, secondary). Detects gzip magic bytes since dev server may auto-decompress.
-2. `MapView.setTierData(fclass, geojson)` receives data per tier, sorts features by z-order (motorway on top), and renders via deck.gl layers.
-3. Labels are generated as point candidates along LineStrings at ~0.05 degree intervals, then filtered per viewport using screen-pixel grid spacing (150px minimum).
-4. Search filters features in-memory and highlights matches with a separate yellow GeoJsonLayer.
+1. On map load, PMTiles vector source is registered. MapLibre fetches tiles on demand via HTTP range requests from `public/roads.pmtiles`.
+2. Road layers (line), label layers (symbol), and highlight layers are added per fclass (secondary → primary → trunk → motorway draw order).
+3. Labels use MapLibre's built-in `symbol-placement: line` with collision detection — no custom label filtering needed.
+4. Search uses a pre-built lightweight index (`public/search_index.json`) loaded at startup. Matches are highlighted via MapLibre filter expressions, and the map fits to the merged bbox from the index.
 
 ## Road Styling
 
-Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants in MapView.js. The `fclass` property from OSM data drives both color/width and draw order. `ROAD_LAYERS` defines the per-tier layer array (draw order: secondary → primary → trunk → motorway). Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
+Road styles are defined in `ROAD_STYLES` and `ROAD_LAYER_CONFIGS` constants in MapView.js. The `fclass` property from OSM data (preserved in vector tiles) drives color/width. Draw order: secondary (bottom) → motorway (top). Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
+
+## Data Files
+
+- `public/roads.pmtiles` - All road data as a single PMTiles file with named layers (motorway, trunk, primary, secondary)
+- `public/search_index.json` - Lightweight search index: `[{name, fclass, ref, bbox}, ...]`
 
 ## Deployment
 
-GitHub Actions (`.github/workflows/deploy.yml`) auto-deploys to GitHub Pages on push to `main`. Vite is configured with `base: './'` for relative paths. The GeoJSON data files live in `public/` as gzip-compressed `osm_[fclass].geojson.gz` (one file per road type).
+GitHub Actions (`.github/workflows/deploy.yml`) auto-deploys to GitHub Pages on push to `main`. Vite is configured with `base: './'` for relative paths.
 
 ## Language
 
-UI text and comments are in Japanese. The app targets Japanese road data and uses Japanese font stacks for labels.
+UI text and comments are in Japanese. The app targets Japanese road data. Labels use Noto Sans Regular glyphs from Protomaps CDN.

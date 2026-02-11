@@ -9,12 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@deck.gl/core": "^9.0.0",
-    "@deck.gl/layers": "^9.0.0",
-    "@deck.gl/mapbox": "^9.0.0",
     "maplibre-gl": "^4.0.0",
     "marked": "^12.0.2",
-    "pako": "^2.1.0"
+    "pmtiles": "^4.4.0"
   },
   "devDependencies": {
     "vite": "^5.0.0"

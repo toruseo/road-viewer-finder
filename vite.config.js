@@ -16,9 +16,6 @@ export default defineConfig({
   },
   optimizeDeps: {
     include: [
-      '@deck.gl/core',
-      '@deck.gl/layers',
-      '@deck.gl/mapbox',
       'maplibre-gl'
     ]
   }
