@@ -100,20 +100,6 @@ export class MapView {
 
     // Add road layers (draw order: secondary → primary → trunk → motorway)
     for (const config of ROAD_LAYER_CONFIGS) {
-      // Highlight layer (below the road, wider yellow line)
-      this.map.addLayer({
-        id: config.id + '-highlight',
-        type: 'line',
-        source: 'roads',
-        'source-layer': config.sourceLayer,
-        filter: ['==', 'name', ''],  // Nothing matches initially
-        paint: {
-          'line-color': 'rgb(255, 255, 0)',
-          'line-width': 8,
-        },
-      });
-
-      // Road layer
       this.map.addLayer({
         id: config.id,
         type: 'line',
@@ -122,6 +108,21 @@ export class MapView {
         paint: {
           'line-color': config.color,
           'line-width': config.width,
+        },
+      });
+    }
+
+    // Highlight layers (on top of all road layers)
+    for (const config of ROAD_LAYER_CONFIGS) {
+      this.map.addLayer({
+        id: config.id + '-highlight',
+        type: 'line',
+        source: 'roads',
+        'source-layer': config.sourceLayer,
+        filter: ['has', '__none__'],  // Match nothing initially
+        paint: {
+          'line-color': 'rgb(255, 255, 0)',
+          'line-width': 8,
         },
       });
     }
@@ -207,7 +208,7 @@ export class MapView {
    */
   clearHighlight() {
     for (const config of ROAD_LAYER_CONFIGS) {
-      this.map.setFilter(config.id + '-highlight', ['==', 'name', '']);
+      this.map.setFilter(config.id + '-highlight', ['has', '__none__']);
     }
   }
 
