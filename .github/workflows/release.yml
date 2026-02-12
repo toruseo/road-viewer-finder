@@ -55,14 +55,19 @@ jobs:
             echo "Created osm_${fclass}.data.js ($(du -h "dist/osm_${fclass}.data.js" | cut -f1))"
           done
 
-      - name: Add README
+      - name: Add README and LICENSE
         run: |
-          cat > dist/README.md << 'READMEEOF'
+          TAG=${{ github.event.release.tag_name }}
+          cat > dist/README.md << READMEEOF
           # road-viewer-finder ローカル版
+
+          バージョン: ${TAG}
+
+          GitHub: https://github.com/toruseo/road-viewer-finder
 
           ## 使い方
 
-          zipを展開し、`index.html` をブラウザで開いてください。ローカルサーバーは不要です。
+          zipを展開し、\`index.html\` をブラウザで開いてください。ローカルサーバーは不要です。
 
           ## 動作要件
 
@@ -73,20 +78,25 @@ jobs:
 
           | ファイル | 内容 |
           |---|---|
-          | `index.html` | アプリ本体（JS埋め込み済み） |
-          | `osm_*.data.js` | 道路データ（GeoJSON gzip → base64） |
-          | `favicon.svg` | アイコン |
-          | `help_246.png` | ヘルプ画像 |
+          | \`index.html\` | アプリ本体（JS埋め込み済み） |
+          | \`osm_*.data.js\` | 道路データ（GeoJSON gzip → base64） |
+          | \`favicon.svg\` | アイコン |
+          | \`help_246.png\` | ヘルプ画像 |
 
           ## 技術的な補足
 
-          通常のWebアプリは `file://` プロトコルではCORS制約によりJSやデータの読み込みに失敗します。本リリース版では以下の対策を行っています。
+          通常のWebアプリは \`file://\` プロトコルではCORS制約によりJSやデータの読み込みに失敗します。本リリース版では以下の対策を行っています。
 
           - **JS**: ビルド出力をHTMLにインライン化（外部ファイル読み込み不要）
-          - **道路データ**: `.geojson.gz` をbase64エンコードした `.data.js` に変換し、`<script>` タグ経由で読み込み（`fetch()` を使わない）
+          - **道路データ**: \`.geojson.gz\` をbase64エンコードした \`.data.js\` に変換し、\`<script>\` タグ経由で読み込み（\`fetch()\` を使わない）
 
           地図タイルはMapLibre GL JSが外部タイルサーバーから取得するため、インターネット接続は引き続き必要です。
+
+          ## ライセンス
+
+          MIT License - 詳細は LICENSE ファイルを参照してください。
           READMEEOF
+          cp LICENSE dist/LICENSE
 
       - name: Clean up files not needed in release
         run: |
@@ -95,10 +105,10 @@ jobs:
           rm -rf dist/.claude
 
       - name: Create zip archive
-        run: cd dist && zip -r ../road-viewer-finder-${{ github.event.release.tag_name }}.zip .
+        run: cd dist && zip -r ../road-viewer-finder-local.zip .
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name }}
-          files: road-viewer-finder-${{ github.event.release.tag_name }}.zip
+          files: road-viewer-finder-local.zip
