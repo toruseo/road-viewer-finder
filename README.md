@@ -31,6 +31,10 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 | 主要地方道 | 緑 | 都道府県道のうちの主要地方道（1-2桁番号）．OSMのprimaryクラス
 | 一般都道府県道 | 緑（細） |都道府県道のうちの主要地方道でないもの（3桁番号）．OSMのsecondaryクラス
 
+## ローカル版
+
+ローカルで動作する版も本リポジトリの[Releaseからダウンロード](https://github.com/toruseo/road-viewer-finder/releases/latest/download/road-viewer-finder-local.zip)できます．
+
 ## 開発者向け情報
 
 詳細は[Github](https://github.com/toruseo/road-viewer-finder)の[CLAUDE.md](https://github.com/toruseo/road-viewer-finder/blob/main/CLAUDE.md)を参照してください．
