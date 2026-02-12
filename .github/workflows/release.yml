@@ -28,6 +28,72 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Inline JS into HTML for file:// support
+        run: |
+          node << 'NODESCRIPT'
+          const fs = require('fs');
+          let html = fs.readFileSync('dist/index.html', 'utf8');
+          const m = html.match(/<script[^>]+src="\.\/assets\/(index-[^"]+\.js)"[^>]*><\/script>/);
+          if (m) {
+            const js = fs.readFileSync('dist/assets/' + m[1], 'utf8');
+            const idx = html.indexOf(m[0]);
+            const safeJs = js.replace(/<\/script/gi, '<\\/script');
+            html = html.substring(0, idx)
+              + '<script type="module">' + safeJs + '</script>'
+              + html.substring(idx + m[0].length);
+            fs.writeFileSync('dist/index.html', html);
+            console.log('Inlined ' + m[1] + ' into HTML');
+          }
+          NODESCRIPT
+
+      - name: Convert gz data to JS for file:// script loading
+        run: |
+          for fclass in motorway trunk primary secondary; do
+            printf "window.__roadGzB64=window.__roadGzB64||{};window.__roadGzB64['%s']='" "$fclass" > "dist/osm_${fclass}.data.js"
+            base64 -w0 "dist/osm_${fclass}.geojson.gz" >> "dist/osm_${fclass}.data.js"
+            printf "';\n" >> "dist/osm_${fclass}.data.js"
+            echo "Created osm_${fclass}.data.js ($(du -h "dist/osm_${fclass}.data.js" | cut -f1))"
+          done
+
+      - name: Add README
+        run: |
+          cat > dist/README.md << 'READMEEOF'
+          # road-viewer-finder ローカル版
+
+          ## 使い方
+
+          zipを展開し、`index.html` をブラウザで開いてください。ローカルサーバーは不要です。
+
+          ## 動作要件
+
+          - モダンブラウザ（Chrome, Firefox, Edge）
+          - インターネット接続（地図タイルの読み込みに必要）
+
+          ## ファイル構成
+
+          | ファイル | 内容 |
+          |---|---|
+          | `index.html` | アプリ本体（JS埋め込み済み） |
+          | `osm_*.data.js` | 道路データ（GeoJSON gzip → base64） |
+          | `favicon.svg` | アイコン |
+          | `help_246.png` | ヘルプ画像 |
+
+          ## 技術的な補足
+
+          通常のWebアプリは `file://` プロトコルではCORS制約によりJSやデータの読み込みに失敗します。本リリース版では以下の対策を行っています。
+
+          - **JS**: ビルド出力をHTMLにインライン化（外部ファイル読み込み不要）
+          - **道路データ**: `.geojson.gz` をbase64エンコードした `.data.js` に変換し、`<script>` タグ経由で読み込み（`fetch()` を使わない）
+
+          地図タイルはMapLibre GL JSが外部タイルサーバーから取得するため、インターネット接続は引き続き必要です。
+          READMEEOF
+
+      - name: Clean up files not needed in release
+        run: |
+          rm -f dist/osm_*.geojson.gz
+          rm -rf dist/assets
+          rm -rf dist/.claude
+
       - name: Create zip archive
         run: cd dist && zip -r ../road-viewer-finder-${{ github.event.release.tag_name }}.zip .
 

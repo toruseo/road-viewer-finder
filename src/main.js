@@ -227,29 +227,34 @@ class App {
    * @returns {Promise<Object>} parsed GeoJSON
    */
   async _fetchFclassData(fclass) {
-    const url = import.meta.env.BASE_URL + 'osm_' + fclass + '.geojson.gz';
-    const response = await fetch(url);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} for ${fclass}`);
-    }
+    let combined;
+    try {
+      const url = import.meta.env.BASE_URL + 'osm_' + fclass + '.geojson.gz';
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} for ${fclass}`);
+      }
 
-    const reader = response.body.getReader();
-    const chunks = [];
-    let received = 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
-    }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+      }
 
-    // Combine chunks
-    const combined = new Uint8Array(received);
-    let offset = 0;
-    for (const chunk of chunks) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
+      combined = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+    } catch (e) {
+      // file:// fallback: load base64-encoded gz via script tag
+      combined = await this._loadGzViaScript(fclass);
     }
 
     // Detect gzip and decompress if needed
@@ -261,6 +266,32 @@ class App {
       const text = new TextDecoder().decode(combined);
       return JSON.parse(text);
     }
+  }
+
+  /**
+   * file://用フォールバック: scriptタグ経由でbase64エンコードされたgzデータを読み込む
+   * リリースzip内の osm_[fclass].data.js を動的に読み込む
+   */
+  _loadGzViaScript(fclass) {
+    return new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = (import.meta.env.BASE_URL || './') + 'osm_' + fclass + '.data.js';
+      script.onload = () => {
+        const b64 = window.__roadGzB64?.[fclass];
+        if (!b64) {
+          reject(new Error(`No embedded data for ${fclass}`));
+          return;
+        }
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        resolve(bytes);
+      };
+      script.onerror = () => reject(new Error(`Failed to load data for ${fclass}`));
+      document.head.appendChild(script);
+    });
   }
 }
 

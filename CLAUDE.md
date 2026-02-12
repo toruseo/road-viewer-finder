@@ -44,6 +44,15 @@ Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants
 
 GitHub Actions (`.github/workflows/deploy.yml`) auto-deploys to GitHub Pages on push to `main`. Vite is configured with `base: './'` for relative paths. The GeoJSON data files live in `public/` as gzip-compressed `osm_[fclass].geojson.gz` (one file per road type).
 
+## Release (ローカル版配布)
+
+GitHub Actions (`.github/workflows/release.yml`) がリリース公開時に自動実行され、`file://` で直接開けるzipをリリースに添付する。ポストビルド処理で以下を行う:
+
+1. **JSインライン化**: ビルド出力のJSをHTMLに埋め込み（`<script type="module">` インライン、src属性なし → `file://` でCORSに引っかからない）
+2. **データ変換**: `.geojson.gz` → `.data.js`（base64エンコード、`<script>` タグで読み込み可能）
+
+`src/main.js` の `_fetchFclassData` は `fetch()` 失敗時に `_loadGzViaScript` へフォールバックする。このフォールバックは `.data.js` を動的 `<script>` タグで読み込み、base64デコード → pako解凍する。通常のHTTP環境（GitHub Pages）では `fetch()` が成功するため影響なし。
+
 ## Language
 
 UI text and comments are in Japanese. The app targets Japanese road data and uses Japanese font stacks for labels.
