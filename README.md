@@ -1,10 +1,10 @@
-# 道路閲覧検索アプリ/road-viewer-finder
+# 道路閲覧検索アプリ
+
+日本の主要道路を簡単に閲覧・検索するためのWebアプリ．
+特に，「あの道路どこだっけ？」みたいな疑問を検索で簡単に解消することを目的にしています．
 
 公開ページ：https://toruseo.jp/road-viewer-finder/
 
-日本の主要道路を簡単に閲覧・検索するためのWebアプリ
-
-特に，「あの道路どこだっけ？」みたいな疑問を検索で簡単に解消することを目的にしています：
 ![検索例](public/help_246.png)
 
 OSMを独自軽量化したデータに基づいているので，正確性には限界があります．
@@ -47,7 +47,7 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 
 コード：MIT License
 
-地図データ（`public/osm.geojson_*.gz`）：
+地図データ（`public/osm_*.geojson.gz`）：
 (c) OpenStreetMap contributors. 
 Open Database License (ODbL) v1.0.
 https://github.com/toruseo/osm-road-extractor-simplifier により生成
