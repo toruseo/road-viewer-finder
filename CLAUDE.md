@@ -40,9 +40,26 @@ The app has two active source files with clear responsibilities:
 
 Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants in MapView.js. The `fclass` property from OSM data drives both color/width and draw order. `ROAD_LAYERS` defines the per-tier layer array (draw order: secondary → primary → trunk → motorway). Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
 
-## Deployment
+## Deployment (GitHub Pages shell + Cloudflare R2 data)
 
-GitHub Actions (`.github/workflows/deploy.yml`) auto-deploys to GitHub Pages on push to `main`. Vite is configured with `base: './'` for relative paths. The GeoJSON data files live in `public/` as gzip-compressed `osm_[fclass].geojson.gz` (one file per road type).
+`main` への push で 2 つのワークフローが並列に走る:
+
+- `.github/workflows/deploy.yml` — `dist/` をビルドして Pages にデプロイ。**`npm run build` の前に `public/osm_*.geojson.gz` を削除**するので、Pages アーティファクトは JS/HTML/CSS シェルだけになる。`VITE_DATA_BASE` (公開 r2.dev URL、末尾スラッシュ付き) と `VITE_DATA_VERSION` (`${{ github.sha }}` をクエリに付けてキャッシュバスティング) を環境変数として注入する。
+- `.github/workflows/r2-sync.yml` — `public/osm_*.geojson.gz` の変更時に `wrangler r2 object put --remote` で Cloudflare R2 バケットへ全ファイルをアップロードする。
+
+**なぜ分割するか:** Pages の帯域は従量制 (月100 GB ソフト上限)。R2 は egress 無料。重い GeoJSON (~200 MB) は R2 側で持つ。
+
+**`VITE_DATA_BASE` / `VITE_DATA_VERSION`** は `src/main.js` の `_fetchFclassData` を駆動する。空 (= ローカル dev / リリース zip) の場合は `BASE_URL` (相対) にフォールバックするので `npm run dev` ではネット往復なしでローカルの `public/osm_*.geojson.gz` が使われる。元データは引き続き `public/` にコミットしておく。
+
+**必要な GitHub Secrets** (`r2-sync.yml` 用): `CLOUDFLARE_API_TOKEN` (R2 Edit スコープ), `CLOUDFLARE_ACCOUNT_ID`, `R2_BUCKET` (内部バケット名、`pub-…` ではない)。
+
+**公開 r2.dev URL のセットアップ:** R2 バケット作成後、ダッシュボードの "Public Access" (R2.dev subdomain) を有効化し、表示される `https://pub-<hash>.r2.dev/` を `deploy.yml` の `VITE_DATA_BASE` に書き込む (現在はプレースホルダ)。
+
+**CORS は CI が適用する** — 手動ではなく。`.github/r2-cors.json` がポリシー本体で、`r2-sync.yml` が毎トリガで `wrangler r2 bucket cors set` を流す (冪等)。`.github/r2-cors.json` 自体も `paths:` フィルタに入っているので、編集すれば自動再適用される。新しいオリジンから動作確認したいときは、ローカルで `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` を export してから `npx wrangler r2 bucket cors set <bucket> --file .github/r2-cors.json` を実行する。CORS が無いとブラウザの fetch は不透明な CORS エラーで黙って失敗する。
+
+**race window:** `deploy.yml` と `r2-sync.yml` は並列実行される。データ変更時、Pages ビルドが新しい `?v=<sha>` を参照しているのに R2/Cloudflare CDN がまだ古いオブジェクトを返す数分の窓が開く。許容範囲。アトミック性が必要なら `workflow_run` でチェーンする。
+
+Vite は `base: './'` 設定で相対パス。`public/osm_[fclass].geojson.gz` は 4 ファイル (motorway, trunk, primary, secondary)。
 
 ## Release (ローカル版配布)
 

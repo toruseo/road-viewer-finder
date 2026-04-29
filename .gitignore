@@ -96,3 +96,6 @@ nul
 vite.config.*.timestamp-*.mjs
 .VSCodeCounter
 .memo/
+
+# 参考用にローカルへ置いた他リポジトリのクローン
+itic-probe-viewer/

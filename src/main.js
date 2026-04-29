@@ -227,9 +227,17 @@ class App {
    * @returns {Promise<Object>} parsed GeoJSON
    */
   async _fetchFclassData(fclass) {
+    // データ取得元のベースURL。VITE_DATA_BASE が空ならVite dev serverやリリース版のために
+    // BASE_URL (= './' 相対) へフォールバックする。GitHub Pagesビルドでは deploy.yml が
+    // 公開r2.dev URL(末尾スラッシュ付き)を注入する。
+    // VITE_DATA_VERSIONはCDNキャッシュバスティング用のクエリ文字列(コミットSHA)。
+    const DATA_BASE = import.meta.env.VITE_DATA_BASE || import.meta.env.BASE_URL;
+    const DATA_VERSION = import.meta.env.VITE_DATA_VERSION || '';
+    const VQ = DATA_VERSION ? `?v=${encodeURIComponent(DATA_VERSION)}` : '';
+
     let combined;
     try {
-      const url = import.meta.env.BASE_URL + 'osm_' + fclass + '.geojson.gz';
+      const url = `${DATA_BASE}osm_${fclass}.geojson.gz${VQ}`;
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status} for ${fclass}`);

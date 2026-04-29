@@ -31,7 +31,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # データ本体はCloudflare R2 (公開r2.devエンドポイント) から配信するので、Pagesアーティファクトには含めない。
+      - name: Strip bundled data from public/
+        run: |
+          rm -f public/osm_*.geojson.gz
+
       - name: Build
+        env:
+          # 末尾スラッシュ必須(main.jsで `${DATA_BASE}osm_<fclass>.geojson.gz` の形で連結する)。
+          VITE_DATA_BASE: https://pub-34bad449e4ab43ea973ed5d5617595c1.r2.dev/
+          # R2はオブジェクト同名で更新するため、コミットSHAをクエリに付けてブラウザ/Cloudflare CDNキャッシュを無効化する。
+          VITE_DATA_VERSION: ${{ github.sha }}
         run: npm run build
 
       - name: Setup Pages
