@@ -1,9 +1,24 @@
 /**
  * MapView - deck.gl + MapLibre GL JS integration
+ *
+ * 道路データはdataProcessorが生成したバイナリバンドル（Float32Arrayセグメント配列）
+ * として受け取り、LineLayerのバイナリ属性で描画する。GeoJSONオブジェクトは保持せず、
+ * テッセレーションも発生しないため、読み込み時のフリーズがない。
+ *
+ * 描画は3段階のLOD:
+ * - zoom < 8:           粗い簡略化ジオメトリ（全国1レイヤー/種別）
+ * - 8 <= zoom < 10.5:   細かい簡略化ジオメトリ（全国1レイヤー/種別）
+ * - zoom >= 10.5:       フル詳細（ビューポート内のグリッドセルのみレイヤー生成）
  */
 import maplibregl from 'maplibre-gl';
-import { GeoJsonLayer, TextLayer } from '@deck.gl/layers';
+import { PathLayer, TextLayer } from '@deck.gl/layers';
+import { COORDINATE_SYSTEM } from '@deck.gl/core';
 import { MapboxOverlay } from '@deck.gl/mapbox';
+import {
+  COORD_QUANT,
+  GRID_CELL_SIZE_LNG, GRID_CELL_SIZE_LAT,
+  GRID_ORIGIN_LNG, GRID_ORIGIN_LAT, cellKey,
+} from './dataProcessor.js';
 
 // Display names for fclass (user-facing)
 const FCLASS_DISPLAY_NAMES = {
@@ -22,15 +37,6 @@ export const ROAD_STYLES = {
 };
 export const DEFAULT_ROAD_STYLE = { color: [128, 128, 128, 255], width: 1 };
 
-// Z-order priority: higher number = drawn later (on top)
-const Z_ORDER = {
-  secondary: 1,
-  primary: 2,
-  trunk: 3,
-  motorway: 4,
-};
-const DEFAULT_Z_ORDER = 0;
-
 // Road layer definitions: array order = draw order (first = bottom, last = top)
 export const ROAD_LAYERS = [
   { id: 'road-secondary', fclass: 'secondary', ...ROAD_STYLES.secondary },
@@ -39,84 +45,15 @@ export const ROAD_LAYERS = [
   { id: 'road-motorway',  fclass: 'motorway',  ...ROAD_STYLES.motorway },
 ];
 
-/**
- * Sort features by z-order (lower z-order drawn first, higher on top)
- */
-function sortByZOrder(geojson) {
-  if (!geojson?.features) return geojson;
+// ラベル優先順（重要な道路から先に配置）
+const LABEL_TIER_ORDER = ['motorway', 'trunk', 'primary', 'secondary'];
 
-  const sortedFeatures = [...geojson.features].sort((a, b) => {
-    const zA = Z_ORDER[a.properties?.fclass] ?? DEFAULT_Z_ORDER;
-    const zB = Z_ORDER[b.properties?.fclass] ?? DEFAULT_Z_ORDER;
-    return zA - zB;
-  });
+// LOD切替ズーム
+const LOD1_MIN_ZOOM = 8;     // これ未満はLOD0（粗）
+const DETAIL_MIN_ZOOM = 10.5; // これ以上はフル詳細（セル単位カリング）
 
-  return {
-    ...geojson,
-    features: sortedFeatures
-  };
-}
-
-// --- Spatial grid partitioning for viewport culling ---
-const GRID_CELL_SIZE = 2; // degrees per cell (~150-220km at Japan's latitude)
-const GRID_ORIGIN_LNG = 122;
-const GRID_ORIGIN_LAT = 24;
-
-/**
- * Compute bounding box [minLng, minLat, maxLng, maxLat] for a GeoJSON feature.
- */
-function getFeatureBBox(feature) {
-  const geom = feature.geometry;
-  if (!geom || !geom.coordinates) return null;
-
-  let minLng = Infinity, minLat = Infinity;
-  let maxLng = -Infinity, maxLat = -Infinity;
-
-  const scan = (coords) => {
-    if (typeof coords[0] === 'number') {
-      if (coords[0] < minLng) minLng = coords[0];
-      if (coords[0] > maxLng) maxLng = coords[0];
-      if (coords[1] < minLat) minLat = coords[1];
-      if (coords[1] > maxLat) maxLat = coords[1];
-    } else {
-      for (const c of coords) scan(c);
-    }
-  };
-
-  scan(geom.coordinates);
-  if (minLng === Infinity) return null;
-  return [minLng, minLat, maxLng, maxLat];
-}
-
-/**
- * Partition a FeatureCollection into spatial grid cells.
- * Features spanning cell boundaries are included in all overlapping cells.
- * @returns {Map<string, Feature[]>} cellKey -> features array
- */
-function partitionFeaturesByGrid(geojson) {
-  const cellMap = new Map();
-
-  for (const feature of geojson.features) {
-    const bbox = getFeatureBBox(feature);
-    if (!bbox) continue;
-
-    const [minLng, minLat, maxLng, maxLat] = bbox;
-    const colMin = Math.floor((minLng - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
-    const colMax = Math.floor((maxLng - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
-    const rowMin = Math.floor((minLat - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
-    const rowMax = Math.floor((maxLat - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
-
-    for (let col = colMin; col <= colMax; col++) {
-      for (let row = rowMin; row <= rowMax; row++) {
-        const key = `${col}_${row}`;
-        if (!cellMap.has(key)) cellMap.set(key, []);
-        cellMap.get(key).push(feature);
-      }
-    }
-  }
-
-  return cellMap;
-}
+// Minimum spacing between labels in screen pixels
+const LABEL_MIN_SPACING_PX = 150;
 
 /**
  * Check if two Sets contain the same elements.
@@ -130,163 +67,24 @@ function setsEqual(a, b) {
   return true;
 }
 
-// Interval for placing label candidates along a line (in degrees, ~5km)
-const LABEL_CANDIDATE_INTERVAL = 0.05;
-
-// Minimum road length to generate labels (in meters, approximate)
-const LABEL_MIN_ROAD_LENGTH_M = 100;
-
-/**
- * Generate evenly-spaced label points along a LineString.
- * Short lines get one point at the midpoint.
- * Long lines get multiple points at regular intervals.
- * Returns an array of { position, angle }.
- */
-function getLinePoints(coordinates) {
-  if (!coordinates || coordinates.length < 2) return [];
-
-  let totalLength = 0;
-  const segments = [];
-
-  for (let i = 0; i < coordinates.length - 1; i++) {
-    const [x1, y1] = coordinates[i];
-    const [x2, y2] = coordinates[i + 1];
-    const length = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
-    segments.push({ start: coordinates[i], end: coordinates[i + 1], length });
-    totalLength += length;
-  }
-
-  if (totalLength === 0) return [];
-
-  // 短い道路のラベルをスキップ（度→メートルの近似変換: 日本緯度帯で1°≈100km）
-  if (totalLength * 100_000 < LABEL_MIN_ROAD_LENGTH_M) return [];
-
-  // Determine how many points to place
-  const numPoints = Math.max(1, Math.round(totalLength / LABEL_CANDIDATE_INTERVAL));
-  const spacing = totalLength / (numPoints + 1);
-
-  const points = [];
-
-  for (let p = 1; p <= numPoints; p++) {
-    const targetDist = spacing * p;
-    let accumulated = 0;
-
-    for (const seg of segments) {
-      if (accumulated + seg.length >= targetDist) {
-        const ratio = (targetDist - accumulated) / seg.length;
-        const x = seg.start[0] + (seg.end[0] - seg.start[0]) * ratio;
-        const y = seg.start[1] + (seg.end[1] - seg.start[1]) * ratio;
-
-        const dx = seg.end[0] - seg.start[0];
-        const dy = seg.end[1] - seg.start[1];
-        let angle = Math.atan2(dy, dx) * (180 / Math.PI);
-
-        if (angle > 90) angle -= 180;
-        if (angle < -90) angle += 180;
-
-        points.push({ position: [x, y], angle });
-        break;
-      }
-      accumulated += seg.length;
-    }
-  }
-
-  return points;
-}
-
-// Road importance for label priority (higher = more important, labeled first)
-const LABEL_PRIORITY = {
-  motorway: 5,
-  trunk: 4,
-  primary: 3,
-  secondary: 2,
-};
-const DEFAULT_LABEL_PRIORITY = 1;
-
-// Minimum spacing between labels in screen pixels
-const LABEL_MIN_SPACING_PX = 150;
-
-/**
- * Generate all label candidates from GeoJSON features (no spatial filtering).
- * Sorted by road importance so higher-priority roads get labels first.
- */
-function generateCandidates(geojson) {
-  if (!geojson?.features) return [];
-
-  const candidates = [];
-
-  for (const feature of geojson.features) {
-    const name = feature.properties?.name;
-    if (!name) continue;
-
-    const geometry = feature.geometry;
-    if (!geometry) continue;
-
-    let points = [];
-
-    if (geometry.type === 'LineString') {
-      points = getLinePoints(geometry.coordinates);
-    } else if (geometry.type === 'MultiLineString') {
-      for (const coords of geometry.coordinates) {
-        points.push(...getLinePoints(coords));
-      }
-    }
-
-    const fclass = feature.properties?.fclass || '';
-    const ref = feature.properties?.ref || '';
-    const priority = LABEL_PRIORITY[fclass] || DEFAULT_LABEL_PRIORITY;
-
-    for (const pt of points) {
-      candidates.push({
-        name,
-        position: pt.position,
-        angle: pt.angle,
-        fclass,
-        ref,
-        label: name,
-        priority
-      });
-    }
-  }
-
-  candidates.sort((a, b) => b.priority - a.priority);
-
-  console.log(`Label candidates: ${candidates.length}`);
-  return candidates;
-}
-
 export class MapView {
   constructor(containerId) {
     this.containerId = containerId;
     this.map = null;
     this.deckOverlay = null;
-    this.currentData = { type: 'FeatureCollection', features: [] };
     this.showLabels = true;
-    this.labelCandidates = [];      // All label candidates (pre-computed)
-    this.highlightCandidates = [];  // Label candidates for highlighted roads (priority)
     this.labelsData = [];           // Currently visible labels (filtered by viewport)
     this.tooltip = null;
-    this.highlightData = null;
-    this.tierDataMap = ROAD_LAYERS.map(layer => ({
-      id: layer.id,
-      fclass: layer.fclass,
-      color: layer.color,
-      width: layer.width,
-      geojson: { type: 'FeatureCollection', features: [] },
-      cellMap: new Map(),   // cellKey -> FeatureCollection (for grid-based rendering)
-      cellKeys: [],         // sorted array of cell keys with data
-    }));
-    this._hiddenFclasses = new Set();  // Set of fclass values (null for 'other') currently hidden
-    this._knownFclasses = new Set(ROAD_LAYERS.filter(l => l.fclass).map(l => l.fclass));
-    this._visibleCells = new Set();    // cell keys currently intersecting viewport
-    this._roadLayers = null;  // キャッシュされた道路レイヤー配列
+    this.tiers = new Map();         // fclass -> bundle (dataProcessor output)
+    this._hiddenFclasses = new Set();
+    this._lodLevel = 0;             // 0, 1 = LOD index / 2 = full detail
+    this._visibleCellKeys = new Set();
+    this._roadLayers = null;        // キャッシュされた道路レイヤー配列
+    this._highlight = null;         // { segs, count, sets: Map<fclass, Set<featureIndex>> }
     this._moveThrottleTimer = null;
-    this._handleHover = (info) => this.handleHover(info);
-    this._handleClick = (info) => this.handleClick(info);
-    this._fillColor = [66, 133, 244, 50];
     this._onMoveEnd = null;
     this._lastClickTime = 0;
-    this._lastClickFeature = null;
+    this._lastClickKey = null;
     this.onFeatureDoubleClick = null;  // callback(properties)
   }
 
@@ -338,8 +136,10 @@ export class MapView {
     });
 
     // Initialize deck.gl overlay
+    // useDevicePixels上限2: 高DPI端末（DPR3のスマホ等）でのフラグメント負荷を抑える
     this.deckOverlay = new MapboxOverlay({
       interleaved: false,
+      useDevicePixels: Math.min(window.devicePixelRatio || 1, 2),
       layers: []
     });
 
@@ -348,20 +148,12 @@ export class MapView {
     // Get tooltip element
     this.tooltip = document.getElementById('tooltip');
 
-    // Update cell visibility and labels on viewport change
+    // Update LOD level / cell visibility and labels on viewport change
     this._onMoveEnd = () => {
-      let needUpdate = false;
-
-      // Update visible grid cells
-      const newVisibleCells = this._getVisibleCells();
-      if (!setsEqual(this._visibleCells, newVisibleCells)) {
-        this._visibleCells = newVisibleCells;
-        this._roadLayers = null;
-        needUpdate = true;
-      }
+      let needUpdate = this._refreshViewportState();
 
       // Re-filter labels
-      if (this.showLabels && this.labelCandidates.length > 0) {
+      if (this.showLabels) {
         this.labelsData = this.filterLabelsForViewport();
         needUpdate = true;
       }
@@ -372,15 +164,12 @@ export class MapView {
     };
     this.map.on('moveend', this._onMoveEnd);
 
-    // Throttled cell visibility update during panning (prevents pop-in)
+    // Throttled visibility update during panning/zooming (prevents pop-in)
     this.map.on('move', () => {
       if (this._moveThrottleTimer) return;
       this._moveThrottleTimer = setTimeout(() => {
         this._moveThrottleTimer = null;
-        const newVisibleCells = this._getVisibleCells();
-        if (!setsEqual(this._visibleCells, newVisibleCells)) {
-          this._visibleCells = newVisibleCells;
-          this._roadLayers = null;
+        if (this._refreshViewportState()) {
           this.updateLayers();
         }
       }, 100);
@@ -390,105 +179,151 @@ export class MapView {
   }
 
   /**
-   * Set data for a specific road fclass tier
+   * Set processed data bundle for a specific road fclass tier
    * @param {string} fclass - fclass value (e.g. 'motorway')
-   * @param {Object} geojson - GeoJSON FeatureCollection for this fclass
+   * @param {Object} bundle - dataProcessor.processTier() の出力
    */
-  setTierData(fclass, geojson) {
-    const tier = this.tierDataMap.find(t => t.fclass === fclass);
-    if (tier) {
-      tier.geojson = geojson;
+  setTierBundle(fclass, bundle) {
+    this.tiers.set(fclass, bundle);
+    const numRuns = bundle.cells.reduce((sum, c) => sum + c.numRuns, 0);
+    console.log(`Tier ${fclass}: ${bundle.numFeatures} features, ` +
+      `${bundle.cells.length} cells, ${numRuns} runs, ` +
+      `${bundle.cand.count} label candidates`);
 
-      // Partition features into spatial grid cells
-      const rawCellMap = partitionFeaturesByGrid(geojson);
-      tier.cellMap = new Map();
-      tier.cellKeys = [];
-      for (const [key, features] of rawCellMap) {
-        tier.cellMap.set(key, { type: 'FeatureCollection', features });
-        tier.cellKeys.push(key);
-      }
-      tier.cellKeys.sort();
-      console.log(`Grid partitioned ${fclass}: ${tier.cellKeys.length} cells, ${geojson.features.length} features`);
-    }
-
-    this._rebuildCurrentData();
-    this.labelCandidates = this.showLabels ? generateCandidates(this.currentData) : [];
-    this.labelsData = [];
-    this._visibleCells = this._getVisibleCells();
+    this._refreshViewportState();
     this._roadLayers = null;
+    this.labelsData = [];
     this.updateLayers();
   }
 
   /**
-   * Rebuild currentData from all tier data (for search, labels, etc.)
+   * 現在のズーム・ビューポートからLODレベルと可視セル集合を再計算。
+   * @returns {boolean} 描画レイヤーの再構築が必要なら true
    */
-  _rebuildCurrentData() {
-    const allFeatures = this.tierDataMap.flatMap(t => t.geojson.features);
-    this.currentData = { type: 'FeatureCollection', features: allFeatures };
+  _refreshViewportState() {
+    if (!this.map) return false;
+    const zoom = this.map.getZoom();
+    const level = zoom < LOD1_MIN_ZOOM ? 0 : zoom < DETAIL_MIN_ZOOM ? 1 : 2;
+    const cells = level === 2 ? this._getVisibleCells() : new Set();
+
+    if (level !== this._lodLevel || !setsEqual(cells, this._visibleCellKeys)) {
+      this._lodLevel = level;
+      this._visibleCellKeys = cells;
+      this._roadLayers = null;
+      return true;
+    }
+    return false;
   }
 
   /**
    * Compute which grid cells intersect the current viewport (with padding).
-   * @returns {Set<string>} visible cell keys
+   * @returns {Set<number>} visible cell keys
    */
   _getVisibleCells() {
     if (!this.map) return new Set();
 
     const bounds = this.map.getBounds();
-    const padding = GRID_CELL_SIZE * 0.1;
+    // セグメントは中点でセルに割り当てられるため、長いセグメントのはみ出し分を
+    // 余裕を持ってカバーするパディング（片側~0.2° ≈ 20km超のセグメントまで対応）
+    const padding = 0.2;
     const west = bounds.getWest() - padding;
     const east = bounds.getEast() + padding;
     const south = bounds.getSouth() - padding;
     const north = bounds.getNorth() + padding;
 
-    const colMin = Math.floor((west - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
-    const colMax = Math.floor((east - GRID_ORIGIN_LNG) / GRID_CELL_SIZE);
-    const rowMin = Math.floor((south - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
-    const rowMax = Math.floor((north - GRID_ORIGIN_LAT) / GRID_CELL_SIZE);
+    const colMin = Math.floor((west - GRID_ORIGIN_LNG) / GRID_CELL_SIZE_LNG);
+    const colMax = Math.floor((east - GRID_ORIGIN_LNG) / GRID_CELL_SIZE_LNG);
+    const rowMin = Math.floor((south - GRID_ORIGIN_LAT) / GRID_CELL_SIZE_LAT);
+    const rowMax = Math.floor((north - GRID_ORIGIN_LAT) / GRID_CELL_SIZE_LAT);
 
     const visible = new Set();
     for (let col = colMin; col <= colMax; col++) {
       for (let row = rowMin; row <= rowMax; row++) {
-        visible.add(`${col}_${row}`);
+        visible.add(cellKey(col, row));
       }
     }
     return visible;
   }
 
   /**
-   * Build road layers: one GeoJsonLayer per tier per grid cell.
-   * Visibility is toggled per cell based on viewport intersection.
-   * Data references are preserved to avoid deck.gl re-tessellation.
+   * バイナリパス配列（フラット座標 + startIndices）からPathLayerを生成。
+   * ジョイント・キャップを丸めることで頂点密度の高いポリラインも連続した線に見える。
+   * origin指定あり: セル相対Float32 + LNGLAT_OFFSETS（セルが小さいので投影誤差なし）
+   * origin指定なし: 絶対経緯度 + 通常のLNGLAT（全国規模でも投影誤差なし）
+   */
+  _makePathLayer({ id, positions, startIndices, numPaths, pathFeature, origin = null, def, tier, visible }) {
+    const coordProps = origin ? {
+      coordinateSystem: COORDINATE_SYSTEM.LNGLAT_OFFSETS,
+      coordinateOrigin: [origin[0], origin[1], 0],
+    } : {};
+    return new PathLayer({
+      id,
+      data: {
+        length: numPaths,
+        startIndices,
+        attributes: {
+          getPath: { value: positions, size: 2 },
+        },
+      },
+      _pathType: 'open', // 正規化をスキップ（バイナリ高速パス）
+      positionFormat: 'XY',
+      ...coordProps,
+      visible,
+      pickable: visible,
+      jointRounded: true,
+      capRounded: true,
+      getColor: def.color,
+      getWidth: def.width,
+      widthUnits: 'pixels',
+      widthMinPixels: 1,
+      widthMaxPixels: 20,
+      onHover: (info) => this._handleSegHover(info, tier, pathFeature),
+      onClick: (info) => this._handleSegClick(info, tier, pathFeature),
+    });
+  }
+
+  /**
+   * Build road layers.
+   * 低・中ズーム: 種別毎に全国1枚のLODレイヤー。LOD0/LOD1は両方常駐させ
+   * visibleフラグだけ切り替える（ズーム横断時の再テッセレーションを避ける）。
+   * 高ズーム: ビューポート内セルのみフル詳細レイヤーを生成。
    */
   _buildRoadLayers() {
     this._roadLayers = [];
+    const level = this._lodLevel;
 
-    for (const tier of this.tierDataMap) {
-      const tierHidden = this._hiddenFclasses.has(tier.fclass);
+    for (const def of ROAD_LAYERS) {
+      const tier = this.tiers.get(def.fclass);
+      if (!tier) continue;
+      const hidden = this._hiddenFclasses.has(def.fclass);
 
-      for (const cellKey of tier.cellKeys) {
-        const cellVisible = this._visibleCells.has(cellKey);
-        const visible = !tierHidden && cellVisible;
-
-        this._roadLayers.push(new GeoJsonLayer({
-          id: `${tier.id}__${cellKey}`,
-          data: tier.cellMap.get(cellKey), // same object reference for diff optimization
-          visible,
-          stroked: true,
-          filled: true,
-          lineWidthUnits: 'pixels',
-          lineWidthMinPixels: 1,
-          lineWidthMaxPixels: 20,
-          getLineWidth: tier.width,
-          getLineColor: tier.color,
-          getFillColor: this._fillColor,
-          pointType: 'circle',
-          getPointRadius: 5,
-          pointRadiusUnits: 'pixels',
-          pickable: visible,
-          onHover: this._handleHover,
-          onClick: this._handleClick,
+      for (let li = 0; li < tier.lods.length; li++) {
+        const lod = tier.lods[li];
+        this._roadLayers.push(this._makePathLayer({
+          id: `${def.id}-lod${li}`,
+          positions: lod.positions,
+          startIndices: lod.startIndices,
+          numPaths: lod.numPaths,
+          pathFeature: lod.pathFeature,
+          def, tier,
+          visible: !hidden && level === li,
         }));
+      }
+
+      if (level === 2 && !hidden) {
+        for (const cell of tier.cells) {
+          if (!this._visibleCellKeys.has(cell.key)) continue;
+          this._roadLayers.push(this._makePathLayer({
+            id: `${def.id}-cell${cell.key}`,
+            positions: cell.positions,
+            startIndices: cell.startIndices,
+            numPaths: cell.numRuns,
+            pathFeature: cell.runFeature,
+            origin: cell.origin,
+            def, tier,
+            visible: true,
+          }));
+        }
       }
     }
   }
@@ -505,13 +340,6 @@ export class MapView {
 
     // Add labels if enabled
     if (this.showLabels) {
-      // Generate candidates only if not cached
-      if (this.labelCandidates.length === 0) {
-        this.labelCandidates = generateCandidates(this.currentData);
-      }
-      if (this.highlightData?.features?.length > 0 && this.highlightCandidates.length === 0) {
-        this.highlightCandidates = generateCandidates(this.highlightData);
-      }
       // Filter by viewport pixels if not already done
       if (this.labelsData.length === 0) {
         this.labelsData = this.filterLabelsForViewport();
@@ -547,25 +375,31 @@ export class MapView {
     }
 
     // Add highlight layer if there are highlighted features
-    if (this.highlightData && this.highlightData.features.length > 0) {
-      const highlightLayer = new GeoJsonLayer({
+    if (this._highlight && this._highlight.numPaths > 0) {
+      layers.push(new PathLayer({
         id: 'highlight-layer',
-        data: this.highlightData,
-        stroked: true,
-        filled: false,
-        lineWidthUnits: 'pixels',
-        lineWidthMinPixels: 4,
-        lineWidthMaxPixels: 30,
-        getLineWidth: 8,
-        getLineColor: [255, 255, 0, 255], // Yellow
+        data: {
+          length: this._highlight.numPaths,
+          startIndices: this._highlight.startIndices,
+          attributes: {
+            // 絶対経緯度Float64
+            getPath: { value: this._highlight.positions, size: 2 },
+          },
+        },
+        _pathType: 'open',
+        positionFormat: 'XY',
+        jointRounded: true,
+        capRounded: true,
+        getColor: [255, 255, 0, 255], // Yellow
+        getWidth: 8,
+        widthUnits: 'pixels',
+        widthMinPixels: 4,
+        widthMaxPixels: 30,
         pickable: false
-      });
-      layers.push(highlightLayer);
+      }));
     }
 
     this.deckOverlay.setProps({ layers });
-
-    console.log('Layers set');
   }
 
   /**
@@ -580,7 +414,7 @@ export class MapView {
 
   /**
    * Set visibility for a road fclass
-   * @param {string|null} fclass - fclass value (null for 'other')
+   * @param {string|null} fclass - fclass value
    * @param {boolean} visible
    */
   setFclassVisible(fclass, visible) {
@@ -598,9 +432,10 @@ export class MapView {
    * Filter label candidates by screen-pixel spacing.
    * Projects each candidate to screen coordinates and uses a grid to ensure
    * no two labels are closer than LABEL_MIN_SPACING_PX pixels.
+   * ハイライト中の道路の候補を最優先で配置し、以降は道路種別の重要度順。
    */
   filterLabelsForViewport() {
-    if (!this.labelCandidates.length || !this.map) return [];
+    if (!this.map || this.tiers.size === 0) return [];
 
     const bounds = this.map.getBounds();
     const padding = 0.01;
@@ -610,23 +445,15 @@ export class MapView {
     const north = bounds.getNorth() + padding;
 
     const cellSize = LABEL_MIN_SPACING_PX;
-    const occupied = new Map();
+    const occupied = new Set();
     const labels = [];
 
-    // Process highlight candidates first, then regular candidates
-    const allCandidates = this.highlightCandidates.length > 0
-      ? [...this.highlightCandidates, ...this.labelCandidates]
-      : this.labelCandidates;
-
-    for (const candidate of allCandidates) {
-      // Skip labels for hidden road types
-      const tierFclass = this._knownFclasses.has(candidate.fclass) ? candidate.fclass : null;
-      if (this._hiddenFclasses.has(tierFclass)) continue;
-
-      const [lng, lat] = candidate.position;
+    const tryCandidate = (tier, i) => {
+      const lng = tier.cand.pos[i * 2];
+      const lat = tier.cand.pos[i * 2 + 1];
 
       // Skip candidates outside the viewport
-      if (lng < west || lng > east || lat < south || lat > north) continue;
+      if (lng < west || lng > east || lat < south || lat > north) return;
 
       // Project geographic coordinates to screen pixels
       const pixel = this.map.project([lng, lat]);
@@ -634,20 +461,38 @@ export class MapView {
       const cellY = Math.floor(pixel.y / cellSize);
 
       // Check 3x3 neighborhood for already-placed labels
-      let tooClose = false;
       for (let dx = -1; dx <= 1; dx++) {
         for (let dy = -1; dy <= 1; dy++) {
-          if (occupied.has(`${cellX + dx},${cellY + dy}`)) {
-            tooClose = true;
-            break;
-          }
+          if (occupied.has(`${cellX + dx},${cellY + dy}`)) return;
         }
-        if (tooClose) break;
       }
 
-      if (!tooClose) {
-        labels.push(candidate);
-        occupied.set(`${cellX},${cellY}`, true);
+      labels.push({
+        position: [lng, lat],
+        angle: tier.cand.angle[i],
+        label: tier.props[tier.cand.feature[i]].name,
+      });
+      occupied.add(`${cellX},${cellY}`);
+    };
+
+    // Process highlighted roads' candidates first
+    if (this._highlight) {
+      for (const fclass of LABEL_TIER_ORDER) {
+        const matched = this._highlight.sets.get(fclass);
+        const tier = this.tiers.get(fclass);
+        if (!matched || !tier || this._hiddenFclasses.has(fclass)) continue;
+        for (let i = 0; i < tier.cand.count; i++) {
+          if (matched.has(tier.cand.feature[i])) tryCandidate(tier, i);
+        }
+      }
+    }
+
+    // Then regular candidates in road-importance order
+    for (const fclass of LABEL_TIER_ORDER) {
+      const tier = this.tiers.get(fclass);
+      if (!tier || this._hiddenFclasses.has(fclass)) continue;
+      for (let i = 0; i < tier.cand.count; i++) {
+        tryCandidate(tier, i);
       }
     }
 
@@ -655,102 +500,172 @@ export class MapView {
   }
 
   /**
+   * ピッキング結果からfeature情報を引く（info.index = パス/ラン番号）
+   * @returns {{fi: number, properties: Object}|null}
+   */
+  _featureFromPick(info, tier, pathFeature) {
+    if (info.index == null || info.index < 0) return null;
+    const fi = pathFeature[info.index];
+    return { fi, properties: tier.props[fi] };
+  }
+
+  /**
    * Handle click events for double-click detection
    */
-  handleClick(info) {
-    if (!info.object) return;
+  _handleSegClick(info, tier, pathFeature) {
+    const hit = this._featureFromPick(info, tier, pathFeature);
+    if (!hit) return;
 
+    const clickKey = `${tier.fclass}:${hit.fi}`;
     const now = Date.now();
-    if (now - this._lastClickTime < 400 && this._lastClickFeature === info.object) {
+    if (now - this._lastClickTime < 400 && this._lastClickKey === clickKey) {
       // Double click detected
       if (this.onFeatureDoubleClick) {
-        this.onFeatureDoubleClick(info.object.properties);
+        this.onFeatureDoubleClick(hit.properties);
       }
       this._lastClickTime = 0;
-      this._lastClickFeature = null;
+      this._lastClickKey = null;
     } else {
       this._lastClickTime = now;
-      this._lastClickFeature = info.object;
+      this._lastClickKey = clickKey;
     }
   }
 
   /**
    * Handle hover events on features
-   * @param {Object} info - Picking info from deck.gl
    */
-  handleHover(info) {
+  _handleSegHover(info, tier, pathFeature) {
     if (!this.tooltip) return;
 
-    if (info.object) {
-      const props = info.object.properties;
-      const name = props?.name;
-      if (name) {
-        const fclass = FCLASS_DISPLAY_NAMES[props?.fclass] || props?.fclass || '';
-        const ref = props?.ref || '';
-        const extra = [fclass, ref].filter(Boolean).join(' ');
-        const label = extra ? `${name} (${extra})` : name;
-        this.tooltip.style.display = 'block';
-        this.tooltip.style.left = `${info.x + 10}px`;
-        this.tooltip.style.top = `${info.y + 10}px`;
-        this.tooltip.textContent = label;
-      } else {
-        this.tooltip.style.display = 'none';
-      }
+    const hit = this._featureFromPick(info, tier, pathFeature);
+    const name = hit?.properties?.name;
+    if (name) {
+      const props = hit.properties;
+      const fclass = FCLASS_DISPLAY_NAMES[props.fclass] || props.fclass || '';
+      const ref = props.ref || '';
+      const extra = [fclass, ref].filter(Boolean).join(' ');
+      const label = extra ? `${name} (${extra})` : name;
+      this.tooltip.style.display = 'block';
+      this.tooltip.style.left = `${info.x + 10}px`;
+      this.tooltip.style.top = `${info.y + 10}px`;
+      this.tooltip.textContent = label;
     } else {
       this.tooltip.style.display = 'none';
     }
   }
 
   /**
-   * Fit map bounds to the data
-   * @param {Object} geojson - GeoJSON FeatureCollection
+   * Search for features matching the query
+   * @param {Object} query - Search query { name, fclass, ref }
+   * @returns {Array} - Matching entries [{ tierFclass, index, properties }]
    */
-  fitToData(geojson) {
-    let minLng = Infinity, maxLng = -Infinity;
-    let minLat = Infinity, maxLat = -Infinity;
+  search({ name, fclass, ref }) {
+    const nameTrim = name?.trim() || '';
+    const fclassTrim = fclass?.trim() || '';
+    const refTrim = ref?.trim() || '';
 
-    const features = geojson.features || [];
+    // If all fields are empty, return empty
+    if (!nameTrim && !fclassTrim && !refTrim) return [];
 
-    // Sample features for bounds calculation (for performance)
-    const sampleSize = Math.min(features.length, 10000);
-    const step = Math.max(1, Math.floor(features.length / sampleSize));
+    const refLower = refTrim.toLowerCase();
+    const results = [];
 
-    const processCoords = (coords) => {
-      if (typeof coords[0] === 'number') {
-        // Single coordinate [lng, lat]
-        const lng = coords[0];
-        const lat = coords[1];
-        if (lng < minLng) minLng = lng;
-        if (lng > maxLng) maxLng = lng;
-        if (lat < minLat) minLat = lat;
-        if (lat > maxLat) maxLat = lat;
-      } else {
-        // Array of coordinates
-        for (const c of coords) {
-          processCoords(c);
+    for (const def of ROAD_LAYERS) {
+      const tier = this.tiers.get(def.fclass);
+      if (!tier) continue;
+
+      for (let i = 0; i < tier.numFeatures; i++) {
+        const props = tier.props[i] || {};
+        if (nameTrim && !(props.name || '').includes(nameTrim)) continue;
+        if (fclassTrim && props.fclass !== fclassTrim) continue;
+        if (refTrim) {
+          // ref may contain multiple values separated by ';'
+          const refs = (props.ref || '').split(';').map(r => r.trim().toLowerCase());
+          if (!refs.includes(refLower)) continue;
         }
+        results.push({ tierFclass: def.fclass, index: i, properties: props });
       }
-    };
+    }
+    return results;
+  }
 
-    for (let i = 0; i < features.length; i += step) {
-      const geometry = features[i].geometry;
-      if (geometry && geometry.coordinates) {
-        processCoords(geometry.coordinates);
+  /**
+   * Set highlighted features
+   * @param {Array} matches - search()の結果 [{ tierFclass, index, properties }]
+   */
+  setHighlight(matches) {
+    if (!matches || matches.length === 0) {
+      this.clearHighlight();
+      return;
+    }
+
+    // tierごとのマッチ集合
+    const sets = new Map();
+    for (const m of matches) {
+      if (!sets.has(m.tierFclass)) sets.set(m.tierFclass, new Set());
+      sets.get(m.tierFclass).add(m.index);
+    }
+
+    // パス数・頂点数カウント
+    let numPaths = 0;
+    let numVerts = 0;
+    for (const [fclass, indices] of sets) {
+      const tier = this.tiers.get(fclass);
+      if (!tier) continue;
+      for (const fi of indices) {
+        for (let pi = tier.featurePartStart[fi]; pi < tier.featurePartStart[fi + 1]; pi++) {
+          const n = tier.partStart[pi + 1] - tier.partStart[pi];
+          if (n >= 2) {
+            numPaths++;
+            numVerts += n;
+          }
+        }
       }
     }
 
-    // Validate bounds
-    if (minLng !== Infinity && maxLng !== -Infinity &&
-        minLat !== Infinity && maxLat !== -Infinity) {
-      console.log('Fitting bounds:', [minLng, minLat], [maxLng, maxLat]);
+    // 量子化座標マスターからハイライト用パス配列（絶対経緯度）とbboxを構築
+    const positions = new Float64Array(numVerts * 2);
+    const startIndices = new Uint32Array(numPaths);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    let path = 0;
+    let v = 0;
+    for (const [fclass, indices] of sets) {
+      const tier = this.tiers.get(fclass);
+      if (!tier) continue;
+      const pos = tier.positions;
+      for (const fi of indices) {
+        for (let pi = tier.featurePartStart[fi]; pi < tier.featurePartStart[fi + 1]; pi++) {
+          const start = tier.partStart[pi];
+          const end = tier.partStart[pi + 1];
+          if (end - start < 2) continue;
+          startIndices[path] = v;
+          path++;
+          for (let p = start; p < end; p++) {
+            const x = pos[p * 2] / COORD_QUANT;
+            const y = pos[p * 2 + 1] / COORD_QUANT;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            positions[v * 2] = x;
+            positions[v * 2 + 1] = y;
+            v++;
+          }
+        }
+      }
+    }
 
-      // Add some padding
-      const lngPadding = (maxLng - minLng) * 0.1 || 0.01;
-      const latPadding = (maxLat - minLat) * 0.1 || 0.01;
+    this._highlight = { positions, startIndices, numPaths, sets };
+    this.labelsData = [];
+    this.updateLayers();
 
+    // Fit to highlighted features
+    if (minX !== Infinity) {
+      const lngPadding = (maxX - minX) * 0.1 || 0.01;
+      const latPadding = (maxY - minY) * 0.1 || 0.01;
       this.map.fitBounds([
-        [minLng - lngPadding, minLat - latPadding],
-        [maxLng + lngPadding, maxLat + latPadding]
+        [minX - lngPadding, minY - latPadding],
+        [maxX + lngPadding, maxY + latPadding]
       ], {
         padding: 50,
         maxZoom: 18,
@@ -760,61 +675,10 @@ export class MapView {
   }
 
   /**
-   * Search for features matching the query
-   * @param {Object} query - Search query { name, fclass, ref }
-   * @returns {Array} - Matching features
-   */
-  search({ name, fclass, ref }) {
-    if (!this.currentData?.features) return [];
-
-    const nameTrim = name?.trim() || '';
-    const fclassTrim = fclass?.trim() || '';
-    const refTrim = ref?.trim() || '';
-
-    // If all fields are empty, return empty
-    if (!nameTrim && !fclassTrim && !refTrim) return [];
-
-    return this.currentData.features.filter(f => {
-      const props = f.properties || {};
-      if (nameTrim && !(props.name || '').includes(nameTrim)) return false;
-      if (fclassTrim && props.fclass !== fclassTrim) return false;
-      if (refTrim) {
-        // ref may contain multiple values separated by ';'
-        const refLower = refTrim.toLowerCase();
-        const refs = (props.ref || '').split(';').map(r => r.trim().toLowerCase());
-        if (!refs.includes(refLower)) return false;
-      }
-      return true;
-    });
-  }
-
-  /**
-   * Set highlighted features
-   * @param {Array} features - Features to highlight
-   */
-  setHighlight(features) {
-    if (!features || features.length === 0) {
-      this.highlightData = null;
-      this.highlightCandidates = [];
-    } else {
-      this.highlightData = {
-        type: 'FeatureCollection',
-        features: features
-      };
-      this.highlightCandidates = this.showLabels ? generateCandidates(this.highlightData) : [];
-      // Fit to highlighted features
-      this.fitToData(this.highlightData);
-    }
-    this.labelsData = [];
-    this.updateLayers();
-  }
-
-  /**
    * Clear highlight
    */
   clearHighlight() {
-    this.highlightData = null;
-    this.highlightCandidates = [];
+    this._highlight = null;
     this.labelsData = [];
     this.updateLayers();
   }

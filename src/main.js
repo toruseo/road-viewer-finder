@@ -3,9 +3,11 @@
  * Large-scale GeoJSON WebGL Rendering Application
  */
 import { MapView, ROAD_STYLES, DEFAULT_ROAD_STYLE } from './MapView.js';
-import pako from 'pako';
 import { marked } from 'marked';
 import helpMd from '../README.md?raw';
+// Workerをバンドルにインライン化（blob URL経由で起動）。
+// 別ファイル配信が不要になり、リリース版のJSインライン化（file://実行）でも壊れない。
+import DataWorker from './dataWorker.js?worker&inline';
 
 class App {
   constructor() {
@@ -204,15 +206,15 @@ class App {
     if (statusEl) statusEl.textContent = '読み込み中...';
 
     try {
-      this.loadingPromises[fclass] = this._fetchFclassData(fclass);
-      const geojson = await this.loadingPromises[fclass];
+      this.loadingPromises[fclass] = this._loadTier(fclass, statusEl);
+      const bundle = await this.loadingPromises[fclass];
       delete this.loadingPromises[fclass];
 
-      this.loadedData[fclass] = geojson;
+      this.loadedData[fclass] = true;
       if (statusEl) statusEl.textContent = '';
 
-      console.log(`Loaded ${fclass}: ${geojson?.features?.length || 0} features`);
-      this.mapView.setTierData(fclass, geojson);
+      console.log(`Loaded ${fclass}: ${bundle.numFeatures} features`);
+      this.mapView.setTierBundle(fclass, bundle);
       this.mapView.setFclassVisible(fclass, true);
     } catch (error) {
       delete this.loadingPromises[fclass];
@@ -222,11 +224,28 @@ class App {
   }
 
   /**
-   * Fetch and decompress a per-fclass GeoJSON file
-   * @param {string} fclass
-   * @returns {Promise<Object>} parsed GeoJSON
+   * ダウンロード（進捗表示付き）→ Worker処理 → 描画用バンドル
    */
-  async _fetchFclassData(fclass) {
+  async _loadTier(fclass, statusEl) {
+    const bytes = await this._fetchFclassBytes(fclass, (received, total) => {
+      if (!statusEl) return;
+      if (total > 0) {
+        statusEl.textContent = `読み込み中 ${Math.min(99, Math.round(received / total * 100))}%`;
+      } else {
+        statusEl.textContent = `読み込み中 ${(received / 1048576).toFixed(1)}MB`;
+      }
+    });
+    if (statusEl) statusEl.textContent = 'データ展開中...';
+    return await this._processTier(bytes, fclass);
+  }
+
+  /**
+   * Fetch a per-fclass gzipped GeoJSON file as raw bytes
+   * @param {string} fclass
+   * @param {Function} onProgress - (receivedBytes, totalBytes) コールバック
+   * @returns {Promise<Uint8Array>}
+   */
+  async _fetchFclassBytes(fclass, onProgress) {
     // データ取得元のベースURL。VITE_DATA_BASE が空ならVite dev serverやリリース版のために
     // BASE_URL (= './' 相対) へフォールバックする。GitHub Pagesビルドでは deploy.yml が
     // 公開r2.dev URL(末尾スラッシュ付き)を注入する。
@@ -235,7 +254,6 @@ class App {
     const DATA_VERSION = import.meta.env.VITE_DATA_VERSION || '';
     const VQ = DATA_VERSION ? `?v=${encodeURIComponent(DATA_VERSION)}` : '';
 
-    let combined;
     try {
       const url = `${DATA_BASE}osm_${fclass}.geojson.gz${VQ}`;
       const response = await fetch(url);
@@ -243,6 +261,9 @@ class App {
         throw new Error(`HTTP ${response.status} for ${fclass}`);
       }
 
+      // Content-Lengthは転送サイズなので、dev serverなどが透過解凍する場合は
+      // 受信バイト数と一致しない（その場合は受信量のみ表示）。
+      const total = Number(response.headers.get('Content-Length')) || 0;
       const reader = response.body.getReader();
       const chunks = [];
       let received = 0;
@@ -252,27 +273,58 @@ class App {
         if (done) break;
         chunks.push(value);
         received += value.length;
+        if (onProgress) onProgress(received, total);
       }
 
-      combined = new Uint8Array(received);
+      const combined = new Uint8Array(received);
       let offset = 0;
       for (const chunk of chunks) {
         combined.set(chunk, offset);
         offset += chunk.length;
       }
+      return combined;
     } catch (e) {
       // file:// fallback: load base64-encoded gz via script tag
-      combined = await this._loadGzViaScript(fclass);
+      return await this._loadGzViaScript(fclass);
     }
+  }
 
-    // Detect gzip and decompress if needed
-    const isActuallyGzipped = combined[0] === 0x1f && combined[1] === 0x8b;
-    if (isActuallyGzipped) {
-      const decompressed = pako.ungzip(combined, { to: 'string' });
-      return JSON.parse(decompressed);
-    } else {
-      const text = new TextDecoder().decode(combined);
-      return JSON.parse(text);
+  /**
+   * バイト列をWorkerで処理してバンドル化する。
+   * Workerが使えない環境（blob worker禁止のfile://実行など）では
+   * メインスレッドで同じ処理にフォールバックする。
+   */
+  async _processTier(bytes, fclass) {
+    try {
+      return await new Promise((resolve, reject) => {
+        let worker;
+        try {
+          worker = new DataWorker();
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        worker.onmessage = (ev) => {
+          worker.terminate();
+          if (ev.data.ok) {
+            resolve(ev.data.bundle);
+          } else {
+            reject(new Error(ev.data.error));
+          }
+        };
+        worker.onerror = (ev) => {
+          worker.terminate();
+          reject(new Error(ev.message || 'Worker error'));
+        };
+        // bytesはコピー渡し（転送しない）: Worker起動失敗時もフォールバックで再利用できる
+        worker.postMessage({ fclass, bytes });
+      });
+    } catch (e) {
+      console.warn(`Worker処理に失敗、メインスレッドで処理します (${fclass}):`, e);
+      const { processTier } = await import('./dataProcessor.js');
+      const bundle = processTier(bytes, fclass);
+      delete bundle.transfer;
+      return bundle;
     }
   }
 

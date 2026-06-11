@@ -22,19 +22,21 @@ No test framework or linter is configured. ユーザが `npm run dev` を常時�
 
 ## Architecture
 
-The app has two active source files with clear responsibilities:
+The app has four active source files with clear responsibilities:
 
-- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass GeoJSON loading with gzip decompression (pako). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
-- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with per-tier `GeoJsonLayer`s (roads), a `TextLayer` (labels), and a highlight `GeoJsonLayer` (search results in yellow). Handles viewport-based label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
+- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass data loading (fetch with progress display → Web Worker processing). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
+- **`src/dataProcessor.js`** - Pure functions: gzip decompression (pako), GeoJSON parse, and conversion to binary bundles (Float32Array segment arrays, quantized Int32 master coordinates, LOD simplification via Douglas-Peucker, grid-cell partitioning, label candidates). Used by the worker, and as a main-thread fallback when Workers are unavailable.
+- **`src/dataWorker.js`** - Web Worker entry: runs `processTier` off the main thread and transfers the resulting TypedArrays back (zero-copy). Imported via `?worker&inline` so the release zip's single-file HTML keeps working.
+- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with binary-mode `PathLayer`s (roads + yellow search highlight; rounded joints/caps for continuous-looking polylines) and a `TextLayer` (labels). Handles LOD switching, viewport cell culling, label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
 
 **`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal). Styles are inline in `<style>`, not in separate CSS files.
 
 ## Key Data Flow
 
-1. `App.loadAndShowFclass(fclass)` fetches and decompresses per-fclass files from `public/osm_[fclass].geojson.gz` (four files: motorway, trunk, primary, secondary). Detects gzip magic bytes since dev server may auto-decompress.
-2. `MapView.setTierData(fclass, geojson)` receives data per tier, sorts features by z-order (motorway on top), and renders via deck.gl layers.
-3. Labels are generated as point candidates along LineStrings at ~0.05 degree intervals, then filtered per viewport using screen-pixel grid spacing (150px minimum).
-4. Search filters features in-memory and highlights matches with a separate yellow GeoJsonLayer.
+1. `App.loadAndShowFclass(fclass)` fetches per-fclass files from `public/osm_[fclass].geojson.gz` (four files: motorway, trunk, primary, secondary) as raw bytes with download progress, then hands them to `dataWorker.js`. The worker (or main-thread fallback) detects gzip magic bytes, decompresses, parses, and builds a binary bundle. The main thread never parses GeoJSON.
+2. `MapView.setTierBundle(fclass, bundle)` stores the bundle and renders via deck.gl `PathLayer`s in binary mode (flat coordinate array + `startIndices`, `_pathType: 'open'`, `positionFormat: 'XY'`). `PathLayer` (not `LineLayer`) is required for joint/cap rendering — independent per-segment quads look like fuzzy "caterpillars" on dense polylines; `jointRounded`/`capRounded` make them continuous. Three LOD stages: zoom < 8 uses coarse simplified geometry (~97% segment reduction), zoom 8–10.5 uses fine simplified geometry, zoom ≥ 10.5 renders full detail but only for grid cells intersecting the viewport. Both LOD layers stay resident with `visible` flags (avoids re-tessellation when crossing zoom thresholds); cell layers are created on demand. Within a cell, roads are stored as "runs" (maximal in-cell consecutive vertex sequences; a road crossing a cell boundary is split, duplicating the boundary vertex). LOD layers use absolute lng/lat (plain LNGLAT) — nationwide `LNGLAT_OFFSETS` is NOT usable here because the Web Mercator linearization error grows cubically with latitude distance from the origin (km-scale shifts in Hokkaido). Cell layers use cell-relative Float32 + `LNGLAT_OFFSETS`; cells are 2° lng × 0.5° lat (latitude kept small for the same reason — error at ±0.25° is ~0.2 m, sub-pixel at all zooms).
+3. Labels are precomputed in the worker as point candidates along LineStrings at ~0.05 degree intervals (packed arrays), then filtered per viewport using screen-pixel grid spacing (150px minimum), highlighted roads first, then by road importance.
+4. Search scans per-feature property arrays in-memory; highlight geometry is reconstructed from the quantized coordinate master into a yellow binary `LineLayer` (full 41k-feature highlight builds in ~200ms). Picking maps segment index → feature index → properties for tooltips and double-click search.
 
 ## Road Styling
 
@@ -49,7 +51,7 @@ Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants
 
 **なぜ分割するか:** Pages の帯域は従量制 (月100 GB ソフト上限)。R2 は egress 無料。重い GeoJSON (~200 MB) は R2 側で持つ。
 
-**`VITE_DATA_BASE` / `VITE_DATA_VERSION`** は `src/main.js` の `_fetchFclassData` を駆動する。空 (= ローカル dev / リリース zip) の場合は `BASE_URL` (相対) にフォールバックするので `npm run dev` ではネット往復なしでローカルの `public/osm_*.geojson.gz` が使われる。元データは引き続き `public/` にコミットしておく。
+**`VITE_DATA_BASE` / `VITE_DATA_VERSION`** は `src/main.js` の `_fetchFclassBytes` を駆動する。空 (= ローカル dev / リリース zip) の場合は `BASE_URL` (相対) にフォールバックするので `npm run dev` ではネット往復なしでローカルの `public/osm_*.geojson.gz` が使われる。元データは引き続き `public/` にコミットしておく。
 
 **必要な GitHub Secrets** (`r2-sync.yml` 用): `CLOUDFLARE_API_TOKEN` (R2 Edit スコープ), `CLOUDFLARE_ACCOUNT_ID`, `R2_BUCKET` (内部バケット名、`pub-…` ではない)。
 
@@ -68,7 +70,7 @@ GitHub Actions (`.github/workflows/release.yml`) がリリース公開時に自�
 1. **JSインライン化**: ビルド出力のJSをHTMLに埋め込み（`<script type="module">` インライン、src属性なし → `file://` でCORSに引っかからない）
 2. **データ変換**: `.geojson.gz` → `.data.js`（base64エンコード、`<script>` タグで読み込み可能）
 
-`src/main.js` の `_fetchFclassData` は `fetch()` 失敗時に `_loadGzViaScript` へフォールバックする。このフォールバックは `.data.js` を動的 `<script>` タグで読み込み、base64デコード → pako解凍する。通常のHTTP環境（GitHub Pages）では `fetch()` が成功するため影響なし。
+`src/main.js` の `_fetchFclassBytes` は `fetch()` 失敗時に `_loadGzViaScript` へフォールバックする。このフォールバックは `.data.js` を動的 `<script>` タグで読み込み、base64デコードしたバイト列を返す（解凍はdataProcessorが行う）。通常のHTTP環境（GitHub Pages）では `fetch()` が成功するため影響なし。Workerは `?worker&inline` でメインバンドルに埋め込まれるため追加アセットは無いが、blob Workerが起動できない環境では `_processTier` がメインスレッド処理へフォールバックする。
 
 ## Language
 
