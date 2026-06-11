@@ -40,9 +40,37 @@
     }
 
     #app-title {
-      margin: 0 0 8px 0;
+      margin: 0;
       font-size: 16px;
       color: #333;
+    }
+
+    #controls-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+      margin-bottom: 8px;
+    }
+
+    #controls-toggle {
+      background: none;
+      border: none;
+      font-size: 12px;
+      color: #666;
+      cursor: pointer;
+      padding: 4px 6px;
+      line-height: 1;
+    }
+
+    #controls.collapsed #controls-header {
+      margin-bottom: 0;
+    }
+
+    #controls.collapsed #controls-body {
+      display: none;
     }
 
     #controls {
@@ -358,7 +386,7 @@
   <div id="map"></div>
   <div id="tooltip"></div>
 <div id="legend">
-    <h4>道路種別（大まかな分類）</h4>
+    <h4>道路種別</h4>
     <div class="legend-item" data-fclass="motorway">
       <input type="checkbox" checked>
       <div class="legend-line"></div>
@@ -392,7 +420,11 @@
     </div>
   </div>
   <div id="controls">
-    <h1 id="app-title">道路閲覧検索アプリ</h1>
+    <div id="controls-header">
+      <h1 id="app-title">道路閲覧検索アプリ</h1>
+      <button id="controls-toggle" aria-label="パネルを折り畳む">[閉]</button>
+    </div>
+    <div id="controls-body">
     <button id="help-btn">操作方法</button>
     <div id="search-panel" style="display: block;">
       <div class="search-row">
@@ -425,6 +457,7 @@
         道路名を表示
       </label>
     </div>
+    </div><!-- /#controls-body -->
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

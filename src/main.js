@@ -50,6 +50,9 @@ class App {
       document.getElementById('search-btn').click();
     };
 
+    // Setup controls panel collapse toggle
+    this.setupControlsToggle();
+
     // Setup help modal
     this.setupHelp();
 
@@ -99,6 +102,35 @@ class App {
 
     // Wait for all initial loads in parallel (non-blocking for UI)
     Promise.all(initialLoads).catch(console.error);
+  }
+
+  /**
+   * 左上パネルの折り畳みトグル。
+   * 状態はlocalStorageに保存。保存値がなければ小画面（スマホ）では初期折り畳み。
+   */
+  setupControlsToggle() {
+    const controls = document.getElementById('controls');
+    const header = document.getElementById('controls-header');
+    const toggle = document.getElementById('controls-toggle');
+
+    const apply = (collapsed) => {
+      controls.classList.toggle('collapsed', collapsed);
+      toggle.textContent = collapsed ? '[メニュー開く]' : '[閉]';
+      toggle.setAttribute('aria-expanded', String(!collapsed));
+      toggle.setAttribute('aria-label', collapsed ? 'パネルを展開' : 'パネルを折り畳む');
+    };
+
+    const saved = localStorage.getItem('controls-collapsed');
+    const collapsed = saved !== null
+      ? saved === 'true'
+      : window.matchMedia('(max-width: 600px)').matches;
+    apply(collapsed);
+
+    header.addEventListener('click', () => {
+      const next = !controls.classList.contains('collapsed');
+      localStorage.setItem('controls-collapsed', String(next));
+      apply(next);
+    });
   }
 
   /**
