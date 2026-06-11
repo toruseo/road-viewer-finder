@@ -115,7 +115,7 @@ class App {
 
     const apply = (collapsed) => {
       controls.classList.toggle('collapsed', collapsed);
-      toggle.textContent = collapsed ? '[メニュー開く]' : '[閉]';
+      toggle.textContent = collapsed ? '[検索パネルを開く]' : '[閉]';
       toggle.setAttribute('aria-expanded', String(!collapsed));
       toggle.setAttribute('aria-label', collapsed ? 'パネルを展開' : 'パネルを折り畳む');
     };
