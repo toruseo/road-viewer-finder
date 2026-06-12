@@ -152,12 +152,26 @@ export class MapView {
     // 道路上のダブルクリックは検索（fitBounds）に使うため標準ズームを抑止。
     // 道路がない場所では通常のダブルクリックズームをそのまま許す。
     this.map.on('dblclick', (e) => {
-      const picked = this.deckOverlay.pickObject({
-        x: e.point.x,
-        y: e.point.y,
-        radius: PICKING_RADIUS_PX
-      });
-      if (picked) e.preventDefault();
+      if (this._pickRoadAt(e.point)) e.preventDefault();
+    });
+
+    // タッチ版: ダブルタップズームは dblclick ではなく touchend ベースの
+    // TapZoomHandler が処理するため、道路上のタップは touchend 側で抑止する。
+    // タップ判定（単指・移動なし・短時間）のみ対象にし、ピンチ終了やパン終了は素通しする。
+    this._touchTapStart = null;
+    this.map.on('touchstart', (e) => {
+      this._touchTapStart = e.points.length === 1
+        ? { x: e.point.x, y: e.point.y, time: performance.now() }
+        : null;
+    });
+    this.map.on('touchend', (e) => {
+      const tap = this._touchTapStart;
+      this._touchTapStart = null;
+      if (!tap) return;
+      const dx = e.point.x - tap.x;
+      const dy = e.point.y - tap.y;
+      if (dx * dx + dy * dy > 100 || performance.now() - tap.time > 500) return;
+      if (this._pickRoadAt(e.point)) e.preventDefault();
     });
 
     // Get tooltip element
@@ -522,6 +536,19 @@ export class MapView {
     if (info.index == null || info.index < 0) return null;
     const fi = pathFeature[info.index];
     return { fi, properties: tier.props[fi] };
+  }
+
+  /**
+   * 指定スクリーン座標に道路があるかピッキングで判定（道路レイヤーのみpickable）
+   * @param {{x: number, y: number}} point - スクリーン座標
+   * @returns {Object|null} deck.glのピッキング結果
+   */
+  _pickRoadAt(point) {
+    return this.deckOverlay.pickObject({
+      x: point.x,
+      y: point.y,
+      radius: PICKING_RADIUS_PX
+    });
   }
 
   /**
