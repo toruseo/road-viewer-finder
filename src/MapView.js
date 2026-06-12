@@ -58,6 +58,17 @@ const LABEL_MIN_SPACING_PX = 150;
 // ホバー・クリックの当たり判定半径（描画線幅からの余裕、ピクセル）
 const PICKING_RADIUS_PX = 8;
 
+// タッチ用の当たり判定半径（指はマウスより不正確なので大きめ）
+const TOUCH_PICK_RADIUS_PX = 24;
+
+// ダブルタップ判定: タップ間隔と位置ずれの許容値
+const DOUBLE_TAP_MAX_DELAY_MS = 500;
+const DOUBLE_TAP_MAX_DIST_PX = 40;
+
+// シングルタップ判定: 押下中の移動量と押下時間の上限
+const TAP_MAX_MOVE_PX = 10;
+const TAP_MAX_DURATION_MS = 500;
+
 /**
  * Check if two Sets contain the same elements.
  */
@@ -86,8 +97,9 @@ export class MapView {
     this._highlight = null;         // { segs, count, sets: Map<fclass, Set<featureIndex>> }
     this._moveThrottleTimer = null;
     this._onMoveEnd = null;
-    this._lastClickTime = 0;
-    this._lastClickKey = null;
+    this._pickMeta = new Map();     // layerId -> { tier, pathFeature }（ピッキング結果の解決用）
+    this._lastTap = null;           // 直前のタップ { x, y, time, props }（ダブルタップ判定用）
+    this._touchTapStart = null;     // 進行中タッチの開始情報
     this.onFeatureDoubleClick = null;  // callback(properties)
   }
 
@@ -149,29 +161,61 @@ export class MapView {
 
     this.map.addControl(this.deckOverlay);
 
-    // 道路上のダブルクリックは検索（fitBounds）に使うため標準ズームを抑止。
+    // マウス: ブラウザネイティブのダブルクリック判定をそのまま使う。
+    // 道路上なら標準ズームを抑止して検索コールバックを発火、
     // 道路がない場所では通常のダブルクリックズームをそのまま許す。
     this.map.on('dblclick', (e) => {
-      if (this._pickRoadAt(e.point)) e.preventDefault();
+      const props = this._pickRoadFeatureAt(e.point);
+      if (props) {
+        e.preventDefault();
+        if (this.onFeatureDoubleClick) this.onFeatureDoubleClick(props);
+      }
     });
 
-    // タッチ版: ダブルタップズームは dblclick ではなく touchend ベースの
-    // TapZoomHandler が処理するため、道路上のタップは touchend 側で抑止する。
-    // タップ判定（単指・移動なし・短時間）のみ対象にし、ピンチ終了やパン終了は素通しする。
-    this._touchTapStart = null;
+    // タッチ: ダブルタップズームは dblclick ではなく touchend ベースの
+    // TapZoomHandler が処理するため、自前でダブルタップを検出する。
+    // 「単指・移動なし・短時間」のタップが 500ms 以内・40px 以内に2回続けば成立。
+    // feature の同一性は要求せず、どちらかのタップが道路に当たっていればよい。
     this.map.on('touchstart', (e) => {
       this._touchTapStart = e.points.length === 1
         ? { x: e.point.x, y: e.point.y, time: performance.now() }
         : null;
     });
     this.map.on('touchend', (e) => {
-      const tap = this._touchTapStart;
+      const tapStart = this._touchTapStart;
       this._touchTapStart = null;
-      if (!tap) return;
-      const dx = e.point.x - tap.x;
-      const dy = e.point.y - tap.y;
-      if (dx * dx + dy * dy > 100 || performance.now() - tap.time > 500) return;
-      if (this._pickRoadAt(e.point)) e.preventDefault();
+      if (!tapStart) {
+        this._lastTap = null;  // ピンチ等の後はダブルタップ判定をリセット
+        return;
+      }
+      const now = performance.now();
+      const mx = e.point.x - tapStart.x;
+      const my = e.point.y - tapStart.y;
+      if (mx * mx + my * my > TAP_MAX_MOVE_PX ** 2 ||
+          now - tapStart.time > TAP_MAX_DURATION_MS) {
+        this._lastTap = null;  // パン等はタップとみなさない
+        return;
+      }
+
+      const props = this._pickRoadFeatureAt(e.point, TOUCH_PICK_RADIUS_PX);
+      // 道路上のタップはマップ標準処理（タップズーム）の対象にしない
+      if (props) e.preventDefault();
+
+      const prev = this._lastTap;
+      const dx = prev ? e.point.x - prev.x : 0;
+      const dy = prev ? e.point.y - prev.y : 0;
+      if (prev && now - prev.time < DOUBLE_TAP_MAX_DELAY_MS &&
+          dx * dx + dy * dy < DOUBLE_TAP_MAX_DIST_PX ** 2) {
+        // ダブルタップ成立
+        this._lastTap = null;
+        const target = props || prev.props;
+        if (target) {
+          e.preventDefault();
+          if (this.onFeatureDoubleClick) this.onFeatureDoubleClick(target);
+        }
+      } else {
+        this._lastTap = { x: e.point.x, y: e.point.y, time: now, props };
+      }
     });
 
     // Get tooltip element
@@ -285,6 +329,7 @@ export class MapView {
       coordinateSystem: COORDINATE_SYSTEM.LNGLAT_OFFSETS,
       coordinateOrigin: [origin[0], origin[1], 0],
     } : {};
+    this._pickMeta.set(id, { tier, pathFeature });
     return new PathLayer({
       id,
       data: {
@@ -307,7 +352,6 @@ export class MapView {
       widthMinPixels: 1,
       widthMaxPixels: 20,
       onHover: (info) => this._handleSegHover(info, tier, pathFeature),
-      onClick: (info) => this._handleSegClick(info, tier, pathFeature),
     });
   }
 
@@ -319,6 +363,7 @@ export class MapView {
    */
   _buildRoadLayers() {
     this._roadLayers = [];
+    this._pickMeta.clear();
     const level = this._lodLevel;
 
     for (const def of ROAD_LAYERS) {
@@ -539,38 +584,23 @@ export class MapView {
   }
 
   /**
-   * 指定スクリーン座標に道路があるかピッキングで判定（道路レイヤーのみpickable）
+   * 指定スクリーン座標の道路をピッキングし、featureのプロパティを返す
+   * （道路レイヤーのみpickableなので、当たれば必ず道路）
    * @param {{x: number, y: number}} point - スクリーン座標
-   * @returns {Object|null} deck.glのピッキング結果
+   * @param {number} [radius] - 当たり判定半径（ピクセル）
+   * @returns {Object|null} feature properties
    */
-  _pickRoadAt(point) {
-    return this.deckOverlay.pickObject({
+  _pickRoadFeatureAt(point, radius = PICKING_RADIUS_PX) {
+    const info = this.deckOverlay.pickObject({
       x: point.x,
       y: point.y,
-      radius: PICKING_RADIUS_PX
+      radius
     });
-  }
-
-  /**
-   * Handle click events for double-click detection
-   */
-  _handleSegClick(info, tier, pathFeature) {
-    const hit = this._featureFromPick(info, tier, pathFeature);
-    if (!hit) return;
-
-    const clickKey = `${tier.fclass}:${hit.fi}`;
-    const now = Date.now();
-    if (now - this._lastClickTime < 400 && this._lastClickKey === clickKey) {
-      // Double click detected
-      if (this.onFeatureDoubleClick) {
-        this.onFeatureDoubleClick(hit.properties);
-      }
-      this._lastClickTime = 0;
-      this._lastClickKey = null;
-    } else {
-      this._lastClickTime = now;
-      this._lastClickKey = clickKey;
-    }
+    if (!info || !info.layer) return null;
+    const meta = this._pickMeta.get(info.layer.id);
+    if (!meta) return null;
+    const hit = this._featureFromPick(info, meta.tier, meta.pathFeature);
+    return hit ? hit.properties : null;
   }
 
   /**
