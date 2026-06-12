@@ -40,13 +40,18 @@ class App {
     this.setupSearch();
 
     // Double-click on road: search by fclass + ref
+    // 路線番号がない道路は fclass だけだと同種全道路にマッチしてしまうので、
+    // 代わりに fclass + 道路名で検索する。両方ない場合は何もしない。
     this.mapView.onFeatureDoubleClick = (props) => {
       const fclassInput = document.getElementById('search-fclass');
       const refInput = document.getElementById('search-ref');
       const nameInput = document.getElementById('search-name');
-      nameInput.value = '';
+      const ref = props?.ref || '';
+      const name = props?.name || '';
+      if (!ref && !name) return;
       fclassInput.value = props?.fclass || '';
-      refInput.value = props?.ref || '';
+      refInput.value = ref;
+      nameInput.value = ref ? '' : name;
       document.getElementById('search-btn').click();
     };
 
