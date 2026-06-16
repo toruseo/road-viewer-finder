@@ -36,6 +36,15 @@ class App {
       this.mapView.setLabelsVisible(e.target.checked);
     });
 
+    // Setup satellite toggle
+    const satelliteCheckbox = document.getElementById('satellite-toggle');
+    satelliteCheckbox.checked = localStorage.getItem('satellite') === 'true';
+    this.mapView.setSatelliteVisible(satelliteCheckbox.checked);
+    satelliteCheckbox.addEventListener('change', (e) => {
+      localStorage.setItem('satellite', e.target.checked);
+      this.mapView.setSatelliteVisible(e.target.checked);
+    });
+
     // Setup search
     this.setupSearch();
 

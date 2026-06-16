@@ -121,6 +121,15 @@ export class MapView {
             ],
             tileSize: 256,
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          },
+          'gsi-satellite': {
+            type: 'raster',
+            tiles: [
+              'https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg'
+            ],
+            tileSize: 256,
+            maxzoom: 18,
+            attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">国土地理院</a>'
           }
         },
         layers: [
@@ -130,6 +139,13 @@ export class MapView {
             source: 'osm-tiles',
             minzoom: 0,
             maxzoom: 19
+          },
+          {
+            id: 'gsi-satellite-layer',
+            type: 'raster',
+            source: 'gsi-satellite',
+            minzoom: 0,
+            layout: { visibility: 'none' }
           }
         ]
       },
@@ -484,6 +500,16 @@ export class MapView {
     this.showLabels = visible;
     this.labelsData = []; // Reset filtered labels so they get recalculated
     this.updateLayers();
+  }
+
+  /**
+   * Toggle between OSM and GSI satellite basemap
+   * @param {boolean} satellite - true で衛星画像表示
+   */
+  setSatelliteVisible(satellite) {
+    if (!this.map) return;
+    this.map.setLayoutProperty('osm-tiles-layer', 'visibility', satellite ? 'none' : 'visible');
+    this.map.setLayoutProperty('gsi-satellite-layer', 'visibility', satellite ? 'visible' : 'none');
   }
 
   /**
