@@ -43,11 +43,14 @@ OSMを独自軽量化したデータに基づいているので，正確性に�
 
 ## クレジット・ライセンス
 
-開発者：[瀬尾亨（東京科学大学）](https://toruseo.jp/index_jp.html)＋Claude Code等
-
-コード：MIT License
-
-地図データ（`public/osm_*.geojson.gz`）：
+- 開発者：[瀬尾亨（東京科学大学）](https://toruseo.jp/index_jp.html)
+- コード：MIT License
+- 本アプリ出力画像：[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.ja)
+- 地図データ（`public/osm_*.geojson.gz`）：
 (c) OpenStreetMap contributors. 
 Open Database License (ODbL) v1.0.
 https://github.com/toruseo/osm-road-extractor-simplifier により生成
+- 衛星画像データ：[地理院タイル（全国最新写真）](https://maps.gsi.go.jp/development/ichiran.html)
+- 画像などを二次利用する場合の表記例：「出典：瀬尾亨，https://toruseo.jp/road-viewer-finder CC BY 4.0 / © OpenStreetMap contributors」
+    - 衛星画像使用時は「地理院タイル（全国最新写真）」を追記して下さい
+    - 詳細については各ライセンスをご確認ください
