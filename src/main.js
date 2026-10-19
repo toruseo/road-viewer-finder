@@ -36,6 +36,15 @@ class App {
       this.mapView.setLabelsVisible(e.target.checked);
     });
 
+    // Setup route-number shield toggle
+    const showShieldsCheckbox = document.getElementById('show-shields');
+    showShieldsCheckbox.checked = localStorage.getItem('show-shields') !== 'false';
+    this.mapView.setShieldsVisible(showShieldsCheckbox.checked);
+    showShieldsCheckbox.addEventListener('change', (e) => {
+      localStorage.setItem('show-shields', e.target.checked);
+      this.mapView.setShieldsVisible(e.target.checked);
+    });
+
     // Setup satellite toggle
     const satelliteCheckbox = document.getElementById('satellite-toggle');
     satelliteCheckbox.checked = localStorage.getItem('satellite') === 'true';

@@ -7,8 +7,9 @@
  * - props:            feature毎の属性オブジェクト {fclass, name, ref}（検索・ツールチップ用）
  * - positions:        全頂点の量子化座標 Int32Array（lng*1e7, lat*1e7。ハイライト再構築・bbox用）
  * - partStart / partFeature / featurePartStart: LineStringパートのインデックス
+ * - partBBox:         パート毎のbbox（高ズームでの路線番号シールド配置時にビューポート内パートを抽出）
  * - lods[]:           簡略化ジオメトリのパス配列（低ズーム描画用、絶対経緯度）。
- *                     PathLayerバイナリ形式（フラット座標 + startIndices）
+ *                     PathLayerバイナリ形式（フラット座標 + startIndices）。pathBBoxも持つ
  * - cells[]:          フル詳細パスをグリッドセル毎に「ラン」（セル内連続区間）へ分割したもの。
  *                     高ズームでビューポート内セルのみ描画。座標はセル中心相対のFloat32
  * - cand:             ラベル候補（位置・角度・feature番号のパック配列）
@@ -142,7 +143,7 @@ export function simplify(points, tol) {
  * Long lines get multiple points at regular intervals.
  * Returns an array of { position, angle }.
  */
-function getLinePoints(coordinates) {
+function getLinePoints(coordinates, interval) {
   if (!coordinates || coordinates.length < 2) return [];
 
   let totalLength = 0;
@@ -162,7 +163,7 @@ function getLinePoints(coordinates) {
   if (totalLength * 100_000 < LABEL_MIN_ROAD_LENGTH_M) return [];
 
   // Determine how many points to place
-  const numPoints = Math.max(1, Math.round(totalLength / LABEL_CANDIDATE_INTERVAL));
+  const numPoints = Math.max(1, Math.round(totalLength / interval));
   const spacing = totalLength / (numPoints + 1);
 
   const points = [];
@@ -271,8 +272,9 @@ export function processTier(bytes, fclass) {
     }
 
     const positions = new Float32Array(numVerts * 2);
-    const startIndices = new Uint32Array(numPaths);
+    const startIndices = new Uint32Array(numPaths + 1);
     const pathFeature = new Uint32Array(numPaths);
+    const pathBBox = new Float32Array(numPaths * 4); // minLng, minLat, maxLng, maxLat（シールド配置のビューポート抽出用）
     let path = 0;
     let v = 0;
     for (let pi = 0; pi < numParts; pi++) {
@@ -280,15 +282,46 @@ export function processTier(bytes, fclass) {
       if (s.length < 2) continue;
       startIndices[path] = v;
       pathFeature[path] = partFeature[pi];
-      path++;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (let i = 0; i < s.length; i++) {
-        positions[v * 2] = s[i][0];
-        positions[v * 2 + 1] = s[i][1];
+        const x = s[i][0];
+        const y = s[i][1];
+        positions[v * 2] = x;
+        positions[v * 2 + 1] = y;
         v++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
       }
+      pathBBox[path * 4] = minX;
+      pathBBox[path * 4 + 1] = minY;
+      pathBBox[path * 4 + 2] = maxX;
+      pathBBox[path * 4 + 3] = maxY;
+      path++;
     }
-    return { positions, startIndices, pathFeature, numPaths };
+    startIndices[numPaths] = v;
+    return { positions, startIndices, pathFeature, pathBBox, numPaths };
   });
+
+  // --- フル詳細パートのbbox（高ズームでのシールド配置用ビューポート抽出） ---
+  const partBBox = new Float32Array(numParts * 4);
+  for (let pi = 0; pi < numParts; pi++) {
+    const coords = partsCoords[pi];
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < coords.length; i++) {
+      const x = coords[i][0];
+      const y = coords[i][1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    partBBox[pi * 4] = minX;
+    partBBox[pi * 4 + 1] = minY;
+    partBBox[pi * 4 + 2] = maxX;
+    partBBox[pi * 4 + 3] = maxY;
+  }
 
   // --- フル詳細パスのセル分割（2パス: カウント→充填） ---
   // 各セグメントは中点が属するセルに割り当て、同一セル内の連続セグメント列を
@@ -369,7 +402,7 @@ export function processTier(bytes, fclass) {
   for (let pi = 0; pi < numParts; pi++) {
     const fi = partFeature[pi];
     if (!props[fi].name) continue;
-    for (const pt of getLinePoints(partsCoords[pi])) {
+    for (const pt of getLinePoints(partsCoords[pi], LABEL_CANDIDATE_INTERVAL)) {
       candPos.push(pt.position[0], pt.position[1]);
       candAngle.push(pt.angle);
       candFeature.push(fi);
@@ -390,14 +423,15 @@ export function processTier(bytes, fclass) {
     partStart,
     partFeature,
     featurePartStart,
+    partBBox,
     lods,
     cells,
     cand,
   };
   bundle.transfer = [
-    positions.buffer, partStart.buffer, partFeature.buffer, featurePartStart.buffer,
+    positions.buffer, partStart.buffer, partFeature.buffer, featurePartStart.buffer, partBBox.buffer,
     cand.pos.buffer, cand.angle.buffer, cand.feature.buffer,
-    ...lods.flatMap((l) => [l.positions.buffer, l.startIndices.buffer, l.pathFeature.buffer]),
+    ...lods.flatMap((l) => [l.positions.buffer, l.startIndices.buffer, l.pathFeature.buffer, l.pathBBox.buffer]),
     ...cells.flatMap((c) => [c.positions.buffer, c.startIndices.buffer, c.runFeature.buffer]),
   ];
   return bundle;
