@@ -51,6 +51,17 @@ const LABEL_TIER_ORDER = ['motorway', 'trunk', 'primary', 'secondary'];
 const LOD1_MIN_ZOOM = 8;     // これ未満はLOD0（粗）
 const DETAIL_MIN_ZOOM = 10.5; // これ以上はフル詳細（セル単位カリング）
 
+// --- 道路名ラベルの表示ズーム範囲（種別毎。ハイライト中の道路には適用しない） ---
+// [下限, 上限]: 下限 <= zoom < 上限 のときだけ配置する。上限を設けない場合は Infinity。
+// 縮小表示では下位種別のラベルは上位種別に押し出されてほぼ置かれないのに、
+// 全国分のパスの投影・チェーン構築の負荷だけが大きいので、置かれ始めるズームから対象にする
+const LABEL_ZOOM_RANGE = {
+  motorway:  [0, Infinity],
+  trunk:     [0, Infinity],
+  primary:   [7, Infinity],
+  secondary: [9, Infinity],
+};
+
 // --- 道路名ラベルの配置パラメータ（線に沿ったグリフ単位の配置） ---
 const LABEL_FONT_PX = 14;             // 文字サイズ
 const LABEL_SPACING_PX = 1200;        // 同一チェーン上のラベル間隔（画面上の弧長）
@@ -1120,9 +1131,12 @@ export class MapView {
 
     // 2. その他の道路: 種別優先順に、同一名称ごとにチェーンを組む
     const rule = ruleOf(false);
+    const zoom = this.map.getZoom();
     for (const fclass of LABEL_TIER_ORDER) {
       const tier = this.tiers.get(fclass);
       if (!tier || this._hiddenFclasses.has(fclass)) continue;
+      const [minZoom, maxZoom] = LABEL_ZOOM_RANGE[fclass];
+      if (zoom < minZoom || zoom >= maxZoom) continue;
       const hl = this._highlight ? this._highlight.sets.get(fclass) : null;
       const groups = this._collectPaths(tier, box, proj, (fi) => (hl && hl.has(fi) ? null : tier.props[fi].name || null));
       for (const [name, paths] of groups) {
