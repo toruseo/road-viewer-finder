@@ -18,30 +18,26 @@ No test framework or linter is configured. ユーザが `npm run dev` を常時�
 ## Frameworks
 
 - **Build**: Vite
-- **Render**: deck.gl (GeoJsonLayer, TextLayer) + MapLibre GL JS
+- **Render**: deck.gl (PathLayer, TextLayer, IconLayer) + MapLibre GL JS
 
 ## Architecture
 
-The app has four active source files with clear responsibilities:
-
-- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass data loading (fetch with progress display → Web Worker processing). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
-- **`src/dataProcessor.js`** - Pure functions: gzip decompression (pako), GeoJSON parse, and conversion to binary bundles (Float32Array segment arrays, quantized Int32 master coordinates, LOD simplification via Douglas-Peucker, grid-cell partitioning, per-path bboxes). Used by the worker, and as a main-thread fallback when Workers are unavailable.
-- **`src/dataWorker.js`** - Web Worker entry: runs `processTier` off the main thread and transfers the resulting TypedArrays back (zero-copy). Imported via `?worker&inline` so the release zip's single-file HTML keeps working.
-- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with binary-mode `PathLayer`s (roads + yellow search highlight; rounded joints/caps for continuous-looking polylines) plus a `TextLayer` (road-name glyphs) and `IconLayer` + `TextLayer` (route-number shields). Handles LOD switching, viewport cell culling, view-time label/shield placement in screen space, hover tooltips, double-click detection, and search.
-
-**`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal). Styles are inline in `<style>`, not in separate CSS files.
+- The main thread never parses GeoJSON. Decompression, parsing, and binary-bundle construction run in `src/dataWorker.js`, or in `src/dataProcessor.js` on the main thread when a blob Worker cannot start.
+- The worker is imported via `?worker&inline` so the release zip's single-file HTML works without extra assets.
+- The help modal renders `README.md` (imported with `?raw`, rendered by `marked`), so editing README changes the in-app help.
 
 ## Key Data Flow
 
-1. `App.loadAndShowFclass(fclass)` fetches per-fclass files from `public/osm_[fclass].geojson.gz` (four files: motorway, trunk, primary, secondary) as raw bytes with download progress, then hands them to `dataWorker.js`. The worker (or main-thread fallback) detects gzip magic bytes, decompresses, parses, and builds a binary bundle. The main thread never parses GeoJSON.
-2. `MapView.setTierBundle(fclass, bundle)` stores the bundle and renders via deck.gl `PathLayer`s in binary mode (flat coordinate array + `startIndices`, `_pathType: 'open'`, `positionFormat: 'XY'`). `PathLayer` (not `LineLayer`) is required for joint/cap rendering — independent per-segment quads look like fuzzy "caterpillars" on dense polylines; `jointRounded`/`capRounded` make them continuous. Three LOD stages: zoom < 8 uses coarse simplified geometry (~97% segment reduction), zoom 8–10.5 uses fine simplified geometry, zoom ≥ 10.5 renders full detail but only for grid cells intersecting the viewport. Both LOD layers stay resident with `visible` flags (avoids re-tessellation when crossing zoom thresholds); cell layers are created on demand. Within a cell, roads are stored as "runs" (maximal in-cell consecutive vertex sequences; a road crossing a cell boundary is split, duplicating the boundary vertex). LOD layers use absolute lng/lat (plain LNGLAT) — nationwide `LNGLAT_OFFSETS` is NOT usable here because the Web Mercator linearization error grows cubically with latitude distance from the origin (km-scale shifts in Hokkaido). Cell layers use cell-relative Float32 + `LNGLAT_OFFSETS`; cells are 2° lng × 0.5° lat (latitude kept small for the same reason — error at ±0.25° is ~0.2 m, sub-pixel at all zooms).
-3. Road-name labels are placed at view time by `MapView.placeLabels` as line-following glyph placement (MapLibre-style line symbol placement); nothing is precomputed in the worker. Highlighted roads first, then per fclass: `_collectPaths` projects the viewport-intersecting named paths to screen space and `buildChains` joins same-name paths into branch-free chains; each chain gets targets every `LABEL_SPACING_PX` of screen arc length, and each target searches ±spacing/3 for a spot where the whole string fits: each character is placed individually on the curve (position, tangent angle over a ±7px window, 10px offset to the upper side of the line, advance corrected for the offset curve), rejected if adjacent glyph directions differ by more than `LABEL_MAX_GLYPH_ANGLE_DEG`, if a same-name label is within `LABEL_SAME_NAME_MIN_PX`, or if any glyph rect comes within `LABEL_MIN_GAP_PX` of a placed glyph of any name (`RectHash`). Reading direction is chosen from the center tangent so text is never upside down. The `TextLayer` receives one item per glyph; the glyph rects are kept in `_labelRects` so shields avoid them.
-4. Route-number shields (路線番号アイコン) are placed at view time by `MapView.placeShields` with the same chain machinery. Per fclass (within its zoom range in `SHIELD_ZOOM_RANGE`; minimums: motorway 5, trunk 7, primary 9, secondary 10), `_collectPaths` projects the viewport-intersecting `ref` paths to screen space (LOD geometry below zoom 10.5 via `pathBBox`, full-detail parts via `partBBox` above) with a closed-form Mercator projector; `buildChains` joins paths of the same ref at shared endpoints into branch-free chains (degree-2 nodes only, so dual carriageways stay separate); then each chain gets targets every `SHIELD_SPACING_PX` of screen arc length, and each target searches ±spacing/3 for a spot that is not bent (direction change over the icon width), not within `SHIELD_SAME_REF_MIN_PX` of a placed shield with the same ref, not within `SHIELD_MIN_GAP_PX` of any other shield, and not overlapping name labels (`RectHash`). Rendered as an `IconLayer` (SVG data-URL icons, auto-packed atlas) plus a `TextLayer`; icon outlines follow the official sign shapes (expressway: green rounded rect; national route 118-A おにぎり: Commons PD path; prefectural 118の2: rounded regular hexagon). `;`-separated refs are laid out side by side via `getPixelOffset`, overlapping by `SHIELD_OVERLAP_PX` (later icons drawn on top).
-5. Search scans per-feature property arrays in-memory; highlight geometry is reconstructed from the quantized coordinate master into a yellow binary `LineLayer` (full 41k-feature highlight builds in ~200ms). Picking maps segment index → feature index → properties for tooltips and double-click search.
+- Roads use binary-mode `PathLayer` with `jointRounded`/`capRounded`. `LineLayer` draws each segment as an independent quad, which looks like fuzzy "caterpillars" on dense polylines.
+- Both LOD layers stay resident and are switched with `visible`. Recreating them at zoom thresholds causes re-tessellation.
+- LOD layers use absolute lng/lat (plain LNGLAT). A single nationwide origin with `LNGLAT_OFFSETS` shifts geometry by kilometers in Hokkaido, because the Web Mercator linearization error grows cubically with latitude distance from the origin.
+- Full-detail cell layers use cell-relative Float32 + `LNGLAT_OFFSETS`, with cells of 2° lng × 0.5° lat. The small latitude extent keeps the error at ±0.25° around 0.2 m (sub-pixel at all zooms), so do not enlarge cells in latitude.
+- Highlighting all 41k features of a search result takes about 200 ms.
 
 ## Road Styling
 
-Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants in MapView.js. The `fclass` property from OSM data drives both color/width and draw order. `ROAD_LAYERS` defines the per-tier layer array (draw order: secondary → primary → trunk → motorway). Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
+Legend items in `index.html` carry only `data-fclass`, and `src/main.js` colors them from `ROAD_STYLES` at runtime.
+Change colors in `ROAD_STYLES` only.
 
 ## Deployment (GitHub Pages shell + Cloudflare R2 data)
 
