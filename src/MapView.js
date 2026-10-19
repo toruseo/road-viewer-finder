@@ -54,13 +54,23 @@ const DETAIL_MIN_ZOOM = 10.5; // これ以上はフル詳細（セル単位カ�
 
 // --- 道路名ラベルの配置パラメータ（線に沿ったグリフ単位の配置） ---
 const LABEL_FONT_PX = 14;             // 文字サイズ
-const LABEL_SPACING_PX = 600;         // 同一チェーン上のラベル間隔（画面上の弧長）
+const LABEL_SPACING_PX = 1200;        // 同一チェーン上のラベル間隔（画面上の弧長）
 const LABEL_SAME_NAME_MIN_PX = 250;   // 同一名称の最小間隔（並走チェーンの重複抑止）
+const LABEL_MIN_GAP_PX = 80;          // 道路名ラベル同士（名称を問わない）の最小距離。グリフ矩形の縁どうし
 const LABEL_MAX_GLYPH_ANGLE_DEG = 25; // 隣接グリフ間で許容する進行方向の変化（屈曲部では置かない）
 const LABEL_LINE_OFFSET_PX = 10;      // 線の中心から文字中心までの垂直オフセット（線の上側に出す）
 const LABEL_TANGENT_WINDOW_PX = 7;    // 接線を取る弧長窓（±）。粗いLOD線の細かな折れに文字が反応しないよう文字サイズ程度にする
 const LABEL_SEARCH_STEP_PX = 10;      // 目標位置から前後へ探索する刻み
 const LABEL_FONT_FAMILY = '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif';
+
+// --- 路線番号シールドの表示ズーム範囲（種別毎） ---
+// [下限, 上限]: 下限 <= zoom < 上限 のときだけ表示する。上限を設けない場合は Infinity
+const SHIELD_ZOOM_RANGE = {
+  motorway:  [5, Infinity],
+  trunk:     [7, Infinity],
+  primary:   [9, Infinity],
+  secondary: [10, Infinity],
+};
 
 // --- 路線番号シールド（標識アイコン）の形状 ---
 // 図柄は道路標識の公式様式（標識令 別表第二）に基づく:
@@ -78,23 +88,22 @@ const SHIELD_STYLES = {
 // 縦横比は固定し、番号が収まらない場合は図形を伸ばさず文字サイズを下げる。
 // 角丸長方形（高速）だけは実標識と同様に文字数に応じて横幅が変わる（fixedWidth=false）
 const SHIELD_SHAPES = {
-  expressway:  { height: 16, aspect: 1.0,              textY: 0.5,  innerRatio: 1.0,  pad: 6, fixedWidth: false },
+  expressway:  { height: 22, aspect: 1.0,             textY: 0.5,  innerRatio: 1.0,  pad: 6, fixedWidth: false },
   national:    { height: 22, aspect: 455 / 435,        textY: 0.4,  innerRatio: 0.66, pad: 2, fixedWidth: true },
   prefectural: { height: 18, aspect: 2 / Math.sqrt(3), textY: 0.5,  innerRatio: 1.0,  pad: 6, fixedWidth: true },
 };
 // 国道番号標識の輪郭（Commons SVG の plate パス、座標系 0..455 x 0..435）
 const NATIONAL_SIGN_PATH = 'M 226.99991,425.39429 C 252.11645,425.39429 275.26756,415.76966 293.19578,399.78937 C 362.13553,330.75326 413.14928,244.91516 439.46426,150.46104 C 442.20297,142.16307 443.99982,131.7287 443.99982,120.87729 C 443.99982,76.02669 413.30428,38.28204 369.9794,27.07436 C 323.9411,15.75291 277.71818,9.99998 226.99992,9.99998 C 176.28166,9.99998 130.05873,15.75291 84.02044,27.07436 C 40.69555,38.28204 10.00001,76.02669 10.00001,120.87729 C 10.00001,131.7287 11.79686,142.16307 14.53557,150.46104 C 40.85055,244.91516 91.86431,330.75326 160.80406,399.78937 C 178.73227,415.76966 201.88339,425.39429 226.99991,425.39429 z';
-// 種別毎に表示を始めるズーム（低ズームでは主要路線のみ）
-const SHIELD_MIN_ZOOM = { motorway: 5, trunk: 7, primary: 9, secondary: 10 };
 const SHIELD_FONT_PX = 9;           // 番号の文字サイズ（上限。形状に収まらない番号は縮小）
-const SHIELD_GAP_PX = 2;            // 複数番号を横に並べるときの間隔
+const SHIELD_OVERLAP_PX = 6;        // 複数番号を横に並べるとき隣のアイコンと端を重ねる幅（後の番号が上に描かれる）
 const SHIELD_MARGIN_PX = 3;         // 衝突判定の余白
 const SHIELD_ICON_SCALE = 2;        // アトラス解像度（高DPI端末向け）
 
 // --- 路線番号シールドの配置パラメータ（ネットワークエッジラベリング） ---
-const SHIELD_SPACING_PX = 320;      // 同一チェーン上の配置間隔（画面上の弧長）
+const SHIELD_SPACING_PX = 640;     // 同一チェーン上の配置間隔（画面上の弧長）
 const SHIELD_MIN_CHAIN_PX = 70;     // これより短いチェーンにはシールドを置かない
 const SHIELD_SAME_REF_MIN_PX = 150; // 同一路線番号の最小間隔（上下線分離など並走チェーンの重複抑止）
+const SHIELD_MIN_GAP_PX = 60;       // シールド同士（番号を問わない）の最小距離。衝突矩形の縁どうし（道路名ラベルとの間には適用しない）
 const SHIELD_MAX_BEND_DEG = 30;     // アイコン幅の範囲で許容する道路の方向変化（屈曲部を避ける）
 const SHIELD_SEARCH_STEP_PX = 6;    // 目標位置から前後へ探索する刻み
 
@@ -906,7 +915,9 @@ export class MapView {
         const g = glyphAt(sg);
         if (prev && prev.t[0] * g.t[0] + prev.t[1] * g.t[1] < maxGlyphCos) return null;
         const rect = [g.cx - glyphHalf, g.cy - glyphHalf, g.cx + glyphHalf, g.cy + glyphHalf];
-        if (obstacles.overlaps(rect)) return null;
+        // 既配置ラベルとの最小距離: 判定時だけ矩形を LABEL_MIN_GAP_PX 広げる（登録は元の矩形）
+        const gap = LABEL_MIN_GAP_PX;
+        if (obstacles.overlaps([rect[0] - gap, rect[1] - gap, rect[2] + gap, rect[3] + gap])) return null;
         rects.push(rect);
         items.push({
           position: [proj.lng(g.p[0]), proj.lat(g.p[1])],
@@ -1071,7 +1082,7 @@ export class MapView {
    * 2. 長いチェーンから順に、画面上の弧長に沿って SHIELD_SPACING_PX 間隔の目標位置を取り、
    *    各目標位置の前後を探索して「屈曲していない・端に寄りすぎない・同一番号の既配置から
    *    十分離れている・他のシールドや道路名ラベルと重ならない」最初の位置に置く
-   * 複数番号（';'区切り）は1点に横並びで配置し、矩形は群全体で判定する。
+   * 複数番号（';'区切り）は1点に端を重ねて横並びで配置し、矩形は群全体で判定する。
    * @returns {Array<{position, icon, h, offset, textOffset, text}>}
    */
   placeShields() {
@@ -1088,6 +1099,8 @@ export class MapView {
     if (this.showLabels) {
       for (const r of this._labelRects) obstacles.insert(r);
     }
+    // 配置済みシールドのみ（SHIELD_MIN_GAP_PX の判定用）
+    const placedShields = new RectHash(64);
 
     const placedByRef = new Map(); // `${fclass}|${ref}` -> [x, y, x, y, ...]
     const sameRefMinSq = SHIELD_SAME_REF_MIN_PX * SHIELD_SAME_REF_MIN_PX;
@@ -1097,7 +1110,8 @@ export class MapView {
     for (const fclass of LABEL_TIER_ORDER) {
       const tier = this.tiers.get(fclass);
       if (!tier || this._hiddenFclasses.has(fclass)) continue;
-      if (zoom < SHIELD_MIN_ZOOM[fclass]) continue;
+      const [minZoom, maxZoom] = SHIELD_ZOOM_RANGE[fclass];
+      if (zoom < minZoom || zoom >= maxZoom) continue;
       const style = SHIELD_STYLES[fclass];
       const h = SHIELD_SHAPES[style.shape].height;
       const textDy = (SHIELD_SHAPES[style.shape].textY - 0.5) * h;
@@ -1106,7 +1120,7 @@ export class MapView {
         const refs = ref.split(';').map(r => r.trim()).filter(Boolean);
         if (refs.length === 0) continue;
         const fits = refs.map(r => shieldFit(style.shape, r));
-        const total = fits.reduce((a, f) => a + f.w, 0) + SHIELD_GAP_PX * (refs.length - 1);
+        const total = fits.reduce((a, f) => a + f.w, 0) - SHIELD_OVERLAP_PX * (refs.length - 1);
         const halfW = total / 2;
         const key = `${fclass}|${ref}`;
         let placed = placedByRef.get(key);
@@ -1149,8 +1163,11 @@ export class MapView {
 
                 const rect = [x - halfW - SHIELD_MARGIN_PX, y - h / 2 - SHIELD_MARGIN_PX, x + halfW + SHIELD_MARGIN_PX, y + h / 2 + SHIELD_MARGIN_PX];
                 if (obstacles.overlaps(rect)) continue;
+                const gap = SHIELD_MIN_GAP_PX;
+                if (placedShields.overlaps([rect[0] - gap, rect[1] - gap, rect[2] + gap, rect[3] + gap])) continue;
 
                 obstacles.insert(rect);
+                placedShields.insert(rect);
                 placed.push(x, y);
                 const position = [proj.lng(x), proj.lat(y)];
                 let ox = -halfW;
@@ -1165,7 +1182,7 @@ export class MapView {
                     textOffset: [ox + w / 2, textDy],
                     text: refs[j],
                   });
-                  ox += w + SHIELD_GAP_PX;
+                  ox += w - SHIELD_OVERLAP_PX;
                 }
                 done = true;
                 break;
