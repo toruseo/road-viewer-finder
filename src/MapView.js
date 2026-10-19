@@ -52,8 +52,15 @@ const LABEL_TIER_ORDER = ['motorway', 'trunk', 'primary', 'secondary'];
 const LOD1_MIN_ZOOM = 8;     // これ未満はLOD0（粗）
 const DETAIL_MIN_ZOOM = 10.5; // これ以上はフル詳細（セル単位カリング）
 
-// Minimum spacing between labels in screen pixels
-const LABEL_MIN_SPACING_PX = 150;
+// --- 道路名ラベルの配置パラメータ（線に沿ったグリフ単位の配置） ---
+const LABEL_FONT_PX = 14;             // 文字サイズ
+const LABEL_SPACING_PX = 600;         // 同一チェーン上のラベル間隔（画面上の弧長）
+const LABEL_SAME_NAME_MIN_PX = 250;   // 同一名称の最小間隔（並走チェーンの重複抑止）
+const LABEL_MAX_GLYPH_ANGLE_DEG = 25; // 隣接グリフ間で許容する進行方向の変化（屈曲部では置かない）
+const LABEL_LINE_OFFSET_PX = 10;      // 線の中心から文字中心までの垂直オフセット（線の上側に出す）
+const LABEL_TANGENT_WINDOW_PX = 7;    // 接線を取る弧長窓（±）。粗いLOD線の細かな折れに文字が反応しないよう文字サイズ程度にする
+const LABEL_SEARCH_STEP_PX = 10;      // 目標位置から前後へ探索する刻み
+const LABEL_FONT_FAMILY = '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif';
 
 // --- 路線番号シールド（標識アイコン）の形状 ---
 // 図柄は道路標識の公式様式（標識令 別表第二）に基づく:
@@ -326,7 +333,8 @@ export class MapView {
     this.map = null;
     this.deckOverlay = null;
     this.showLabels = true;
-    this.labelsData = [];           // Currently visible labels (filtered by viewport)
+    this.labelsData = [];           // 配置済みの道路名グリフ（ビューポート毎に再計算）
+    this._labelRects = [];          // 配置済み道路名グリフの画面矩形（シールド配置の障害物）
     this.showShields = true;
     this.shieldsData = [];          // Currently visible route-number shields (filtered by viewport)
     this.tooltip = null;
@@ -482,9 +490,9 @@ export class MapView {
     this._onMoveEnd = () => {
       let needUpdate = this._refreshViewportState();
 
-      // Re-filter labels
+      // Re-place labels (shields are placed after labels and avoid them)
       if (this.showLabels) {
-        this.labelsData = this.filterLabelsForViewport();
+        this.labelsData = this.placeLabels();
         needUpdate = true;
       }
       if (this.showShields) {
@@ -522,7 +530,7 @@ export class MapView {
     const numRuns = bundle.cells.reduce((sum, c) => sum + c.numRuns, 0);
     console.log(`Tier ${fclass}: ${bundle.numFeatures} features, ` +
       `${bundle.cells.length} cells, ${numRuns} runs, ` +
-      `${bundle.cand.count} label candidates`);
+      `${bundle.lods.map((l) => l.numPaths).join('/')} lod paths`);
 
     this._refreshViewportState();
     this._roadLayers = null;
@@ -676,33 +684,33 @@ export class MapView {
 
     // Add labels if enabled
     if (this.showLabels) {
-      // Filter by viewport pixels if not already done
+      // Place labels if not already done for this viewport
       if (this.labelsData.length === 0) {
-        this.labelsData = this.filterLabelsForViewport();
+        this.labelsData = this.placeLabels();
       }
 
-      const labelSize = 14;
+      // 1要素 = 1グリフ。位置・角度・線からのオフセットは placeLabels が曲線に沿って決めている
       const textLayer = new TextLayer({
         id: 'road-labels',
         data: this.labelsData,
         getPosition: d => d.position,
-        getText: d => d.label,
+        getText: d => d.text,
         getAngle: d => d.angle,
-        getSize: labelSize,
+        getSize: LABEL_FONT_PX,
         getColor: [0, 0, 0, 255],
         getTextAnchor: 'middle',
         getAlignmentBaseline: 'center',
-        getPixelOffset: d => {
-          const rad = d.angle * Math.PI / 180;
-          return [-labelSize*0.9 * Math.sin(rad), -labelSize*0.9 * Math.cos(rad)];
-        },
-        fontFamily: '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif',
+        getPixelOffset: d => d.offset,
+        fontFamily: LABEL_FONT_FAMILY,
         fontWeight: 'bold',
-        outlineWidth: 0,
+        // 極薄の白アウトライン（SDF必須）。アトラス解像度を上げ、smoothing（SDFのアンチエイリアス幅）も
+        // 表示縮小率に合わせて広げないとエッジがギザつく。outlineWidth はアトラスのフォントサイズ基準:
+        // 表示14pxでは 5 * 14/96 ≈ 0.7px
+        fontSettings: { sdf: true, fontSize: 96, buffer: 8, radius: 20, smoothing: 0.3 },
+        outlineWidth: 5,
+        outlineColor: [255, 255, 255, 255],
         billboard: false,
         sizeUnits: 'pixels',
-        sizeMinPixels: 12,
-        sizeMaxPixels: 18,
         pickable: false,
         characterSet: 'auto'
       });
@@ -822,74 +830,159 @@ export class MapView {
   }
 
   /**
-   * Filter label candidates by screen-pixel spacing.
-   * Projects each candidate to screen coordinates and uses a grid to ensure
-   * no two labels are closer than LABEL_MIN_SPACING_PX pixels.
-   * ハイライト中の道路の候補を最優先で配置し、以降は道路種別の重要度順。
+   * ビューポートの経緯度範囲（bboxによるパス抽出用。少し広げて端のパスも拾う）。
    */
-  filterLabelsForViewport() {
+  _viewBox() {
+    const b = this.map.getBounds();
+    return { west: b.getWest() - 0.02, east: b.getEast() + 0.02, south: b.getSouth() - 0.02, north: b.getNorth() + 0.02 };
+  }
+
+  /**
+   * 道路名ラベルを線に沿ったグリフ配置（MapLibre の line placement 相当）で決める。
+   * 1. ハイライト中の道路 → 種別優先順に、ビューポート内の名称付きパスを画面座標に投影し、
+   *    同一名称ごとに端点で連結して分岐のないチェーンに組む（buildChains）
+   * 2. 長いチェーンから順に、弧長に沿って LABEL_SPACING_PX 間隔の目標位置を取り、前後を探索して
+   *    文字列全体を曲線上に載せる。各文字は曲線上の位置と接線角で個別に置き、
+   *    隣接文字の角度差が閾値超（屈曲部）、同一名称の既配置に近い、
+   *    いずれかの文字が既配置ラベルと重なる、のどれかなら不採用
+   * 3. 文字列の向きは読み下ろし（右→左）にならないよう中央の接線方向で決める
+   * 配置したグリフ矩形は this._labelRects に残し、シールド配置が障害物として参照する。
+   * @returns {Array<{position, text, angle, offset}>} グリフ配列
+   */
+  placeLabels() {
+    this._labelRects = [];
     if (!this.map || this.tiers.size === 0) return [];
 
-    const bounds = this.map.getBounds();
-    const padding = 0.01;
-    const west = bounds.getWest() - padding;
-    const east = bounds.getEast() + padding;
-    const south = bounds.getSouth() - padding;
-    const north = bounds.getNorth() + padding;
+    const proj = this._screenProjector();
+    const box = this._viewBox();
+    const edge = 40;
+    const obstacles = new RectHash(64);
+    const placedByName = new Map(); // name -> [x, y, ...]
+    const sameNameMinSq = LABEL_SAME_NAME_MIN_PX * LABEL_SAME_NAME_MIN_PX;
+    const maxGlyphCos = Math.cos(LABEL_MAX_GLYPH_ANGLE_DEG * Math.PI / 180);
+    const glyphHalf = LABEL_FONT_PX / 2 + 1; // グリフの衝突矩形（回転を考慮して正方形）
+    const glyphs = [];
 
-    const cellSize = LABEL_MIN_SPACING_PX;
-    const occupied = new Set();
-    const labels = [];
-
-    const tryCandidate = (tier, i) => {
-      const lng = tier.cand.pos[i * 2];
-      const lat = tier.cand.pos[i * 2 + 1];
-
-      // Skip candidates outside the viewport
-      if (lng < west || lng > east || lat < south || lat > north) return;
-
-      // Project geographic coordinates to screen pixels
-      const pixel = this.map.project([lng, lat]);
-      const cellX = Math.floor(pixel.x / cellSize);
-      const cellY = Math.floor(pixel.y / cellSize);
-
-      // Check 3x3 neighborhood for already-placed labels
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          if (occupied.has(`${cellX + dx},${cellY + dy}`)) return;
-        }
-      }
-
-      labels.push({
-        position: [lng, lat],
-        angle: tier.cand.angle[i],
-        label: tier.props[tier.cand.feature[i]].name,
-      });
-      occupied.add(`${cellX},${cellY}`);
+    // 接線（単位ベクトル）: 弧長 s の前後 LABEL_TANGENT_WINDOW_PX の差分
+    const tangentAt = (chain, cum, s, len) => {
+      const a = pointAt(chain, cum, Math.max(0, s - LABEL_TANGENT_WINDOW_PX));
+      const b = pointAt(chain, cum, Math.min(len, s + LABEL_TANGENT_WINDOW_PX));
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const l = Math.hypot(dx, dy) || 1;
+      return [dx / l, dy / l];
     };
 
-    // Process highlighted roads' candidates first
-    if (this._highlight) {
+    // 文字列を弧長 sCenter を中心に置けるか試す。置ければグリフ配列と矩形配列を返す
+    const tryLabel = (chain, cum, len, sCenter, chars, adv, textLen) => {
+      const [tx, ty] = tangentAt(chain, cum, sCenter, len);
+      // 読み方向: 右向き（tx>0）。真縦なら下→上（ty<0）に読む
+      const dir = Math.abs(tx) < 1e-6 ? (ty < 0 ? 1 : -1) : (tx > 0 ? 1 : -1);
+      // 弧長 s のグリフ: 中心線上の点、読み方向の接線、線の上側（画面上方向）へオフセットした文字中心
+      const glyphAt = (s) => {
+        const p = pointAt(chain, cum, s);
+        const t0 = tangentAt(chain, cum, s, len);
+        const t = [t0[0] * dir, t0[1] * dir];
+        const n = [t[1], -t[0]];
+        return { s, p, t, n, cx: p[0] + n[0] * LABEL_LINE_OFFSET_PX, cy: p[1] + n[1] * LABEL_LINE_OFFSET_PX };
+      };
+      const items = [];
+      const rects = [];
+      let prev = null;
+      let sg = sCenter - dir * (textLen / 2 - adv[0] / 2);
+      for (let i = 0; i < chars.length; i++) {
+        if (prev) {
+          // 次の文字の弧長。オフセット曲線上では中心線より間隔が伸縮するので、
+          // 文字中心間の画面距離が所望の送り幅になるよう弧長を補正する
+          const want = (adv[i - 1] + adv[i]) / 2;
+          sg = prev.s + dir * want;
+          for (let k = 0; k < 2; k++) {
+            const g = glyphAt(Math.min(len, Math.max(0, sg)));
+            const d = Math.hypot(g.cx - prev.cx, g.cy - prev.cy);
+            if (d < 1e-3) break;
+            sg = prev.s + (sg - prev.s) * (want / d);
+          }
+        }
+        if (sg < 0 || sg > len) return null;
+        const g = glyphAt(sg);
+        if (prev && prev.t[0] * g.t[0] + prev.t[1] * g.t[1] < maxGlyphCos) return null;
+        const rect = [g.cx - glyphHalf, g.cy - glyphHalf, g.cx + glyphHalf, g.cy + glyphHalf];
+        if (obstacles.overlaps(rect)) return null;
+        rects.push(rect);
+        items.push({
+          position: [proj.lng(g.p[0]), proj.lat(g.p[1])],
+          text: chars[i],
+          angle: -Math.atan2(g.t[1], g.t[0]) * 180 / Math.PI,
+          offset: [g.n[0] * LABEL_LINE_OFFSET_PX, g.n[1] * LABEL_LINE_OFFSET_PX],
+        });
+        prev = g;
+      }
+      return { items, rects };
+    };
+
+    const passes = this._highlight ? [true, false] : [false];
+    for (const highlightedPass of passes) {
       for (const fclass of LABEL_TIER_ORDER) {
-        const matched = this._highlight.sets.get(fclass);
         const tier = this.tiers.get(fclass);
-        if (!matched || !tier || this._hiddenFclasses.has(fclass)) continue;
-        for (let i = 0; i < tier.cand.count; i++) {
-          if (matched.has(tier.cand.feature[i])) tryCandidate(tier, i);
+        if (!tier || this._hiddenFclasses.has(fclass)) continue;
+        const hl = this._highlight ? this._highlight.sets.get(fclass) : null;
+        if (highlightedPass && !hl) continue;
+        const groups = this._collectPaths(tier, box, proj, (fi) => {
+          const name = tier.props[fi].name;
+          if (!name) return null;
+          const inHl = !!hl && hl.has(fi);
+          return inHl === highlightedPass ? name : null;
+        });
+
+        for (const [name, paths] of groups) {
+          const chars = [...name];
+          const adv = chars.map(c => (c.charCodeAt(0) < 128 ? 0.6 : 1.0) * LABEL_FONT_PX);
+          const textLen = adv.reduce((a, b) => a + b, 0);
+          const endMargin = textLen / 2 + 6;
+          let placed = placedByName.get(name);
+          if (!placed) { placed = []; placedByName.set(name, placed); }
+
+          const chains = buildChains(paths).map((c) => {
+            const cum = cumulativeLength(c);
+            return { chain: c, cum, length: cum[c.n - 1] };
+          }).filter((c) => c.length >= textLen + 12).sort((a, b) => b.length - a.length);
+
+          for (const { chain, cum, length } of chains) {
+            const count = Math.max(1, Math.round(length / LABEL_SPACING_PX));
+            for (let i = 0; i < count; i++) {
+              const target = length * (i + 0.5) / count;
+              const maxOffset = Math.min(LABEL_SPACING_PX / 3, length / (2 * count));
+              let done = false;
+              for (let off = 0; off <= maxOffset && !done; off += LABEL_SEARCH_STEP_PX) {
+                for (const sign of (off === 0 ? [1] : [1, -1])) {
+                  const s = target + sign * off;
+                  if (s < endMargin || s > length - endMargin) continue;
+                  const [x, y] = pointAt(chain, cum, s);
+                  if (x < -edge || x > proj.width + edge || y < -edge || y > proj.height + edge) continue;
+
+                  let tooClose = false;
+                  for (let j = 0; j < placed.length; j += 2) {
+                    const dx = x - placed[j], dy = y - placed[j + 1];
+                    if (dx * dx + dy * dy < sameNameMinSq) { tooClose = true; break; }
+                  }
+                  if (tooClose) { done = true; break; } // 並走する別チェーンで既に充足
+
+                  const res = tryLabel(chain, cum, length, s, chars, adv, textLen);
+                  if (!res) continue;
+                  for (const r of res.rects) obstacles.insert(r);
+                  this._labelRects.push(...res.rects);
+                  placed.push(x, y);
+                  glyphs.push(...res.items);
+                  done = true;
+                  break;
+                }
+              }
+            }
+          }
         }
       }
     }
 
-    // Then regular candidates in road-importance order
-    for (const fclass of LABEL_TIER_ORDER) {
-      const tier = this.tiers.get(fclass);
-      if (!tier || this._hiddenFclasses.has(fclass)) continue;
-      for (let i = 0; i < tier.cand.count; i++) {
-        tryCandidate(tier, i);
-      }
-    }
-
-    return labels;
+    return glyphs;
   }
 
   /**
@@ -916,16 +1009,17 @@ export class MapView {
   }
 
   /**
-   * ビューポートに掛かる ref 付きパスを画面座標の折れ線として集める。
+   * ビューポートに掛かるパスを画面座標の折れ線として集め、keyOf(featureIndex) の返す文字列で分類する
+   * （道路名ラベルなら name、路線番号なら ref）。keyOf が null を返す feature は対象外。
    * 現在のLOD段階に応じて簡略化ジオメトリ（低・中ズーム）またはフル詳細（高ズーム）を使う。
    * 端点キーはLOD段階毎の元座標値から作るので、同じ地点で終わるパス同士は同じキーになる。
-   * @returns {Map<string, Array>} ref -> パス配列 [{ pts, n, k0, k1 }]
+   * @returns {Map<string, Array>} key -> パス配列 [{ pts, n, k0, k1 }]
    */
-  _collectRefPaths(tier, box, proj) {
+  _collectPaths(tier, box, proj, keyOf) {
     const groups = new Map();
-    const push = (ref, path) => {
-      let list = groups.get(ref);
-      if (!list) { list = []; groups.set(ref, list); }
+    const push = (key, path) => {
+      let list = groups.get(key);
+      if (!list) { list = []; groups.set(key, list); }
       list.push(path);
     };
     const level = this._lodLevel;
@@ -935,7 +1029,7 @@ export class MapView {
       const bb = lod.pathBBox;
       for (let p = 0; p < lod.numPaths; p++) {
         if (bb[p * 4 + 2] < box.west || bb[p * 4] > box.east || bb[p * 4 + 3] < box.south || bb[p * 4 + 1] > box.north) continue;
-        const ref = tier.props[lod.pathFeature[p]].ref;
+        const ref = keyOf(lod.pathFeature[p]);
         if (!ref) continue;
         const s = lod.startIndices[p];
         const n = lod.startIndices[p + 1] - s;
@@ -953,7 +1047,7 @@ export class MapView {
       const numParts = tier.partFeature.length;
       for (let pi = 0; pi < numParts; pi++) {
         if (bb[pi * 4 + 2] < box.west || bb[pi * 4] > box.east || bb[pi * 4 + 3] < box.south || bb[pi * 4 + 1] > box.north) continue;
-        const ref = tier.props[tier.partFeature[pi]].ref;
+        const ref = keyOf(tier.partFeature[pi]);
         if (!ref) continue;
         const s = tier.partStart[pi];
         const n = tier.partStart[pi + 1] - s;
@@ -985,29 +1079,14 @@ export class MapView {
 
     const zoom = this.map.getZoom();
     const proj = this._screenProjector();
-    const bounds = this.map.getBounds();
-    const box = {
-      west: bounds.getWest() - 0.02, east: bounds.getEast() + 0.02,
-      south: bounds.getSouth() - 0.02, north: bounds.getNorth() + 0.02,
-    };
+    const box = this._viewBox();
     // 画面端の少し外側まで配置対象にして、パン時に端で急に出現するのを減らす
     const edge = 40;
 
+    // 配置済みの道路名ラベル（グリフ矩形）を障害物として登録
     const obstacles = new RectHash(64);
-    // 配置済みの道路名ラベルを障害物として登録（回転した文字列の軸平行外接矩形）
     if (this.showLabels) {
-      const labelSize = 14;
-      for (const l of this.labelsData) {
-        const px = proj.x(l.position[0]);
-        const py = proj.y(l.position[1]);
-        const rad = l.angle * Math.PI / 180;
-        const w = shieldTextWidth(l.label) / SHIELD_FONT_PX * labelSize;
-        const ex = (Math.abs(w * Math.cos(rad)) + Math.abs(labelSize * Math.sin(rad))) / 2;
-        const ey = (Math.abs(w * Math.sin(rad)) + Math.abs(labelSize * Math.cos(rad))) / 2;
-        const cx = px - labelSize * 0.9 * Math.sin(rad);
-        const cy = py - labelSize * 0.9 * Math.cos(rad);
-        obstacles.insert([cx - ex, cy - ey, cx + ex, cy + ey]);
-      }
+      for (const r of this._labelRects) obstacles.insert(r);
     }
 
     const placedByRef = new Map(); // `${fclass}|${ref}` -> [x, y, x, y, ...]
@@ -1023,7 +1102,7 @@ export class MapView {
       const h = SHIELD_SHAPES[style.shape].height;
       const textDy = (SHIELD_SHAPES[style.shape].textY - 0.5) * h;
 
-      for (const [ref, paths] of this._collectRefPaths(tier, box, proj)) {
+      for (const [ref, paths] of this._collectPaths(tier, box, proj, (fi) => tier.props[fi].ref || null)) {
         const refs = ref.split(';').map(r => r.trim()).filter(Boolean);
         if (refs.length === 0) continue;
         const fits = refs.map(r => shieldFit(style.shape, r));

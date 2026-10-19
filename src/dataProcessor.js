@@ -7,12 +7,12 @@
  * - props:            feature毎の属性オブジェクト {fclass, name, ref}（検索・ツールチップ用）
  * - positions:        全頂点の量子化座標 Int32Array（lng*1e7, lat*1e7。ハイライト再構築・bbox用）
  * - partStart / partFeature / featurePartStart: LineStringパートのインデックス
- * - partBBox:         パート毎のbbox（高ズームでの路線番号シールド配置時にビューポート内パートを抽出）
+ * - partBBox:         パート毎のbbox（高ズームでのラベル・シールド配置時にビューポート内パートを抽出）
  * - lods[]:           簡略化ジオメトリのパス配列（低ズーム描画用、絶対経緯度）。
  *                     PathLayerバイナリ形式（フラット座標 + startIndices）。pathBBoxも持つ
+ * ラベル（道路名・路線番号）はビュー時に MapView が画面座標上で配置するため、worker では前計算しない
  * - cells[]:          フル詳細パスをグリッドセル毎に「ラン」（セル内連続区間）へ分割したもの。
  *                     高ズームでビューポート内セルのみ描画。座標はセル中心相対のFloat32
- * - cand:             ラベル候補（位置・角度・feature番号のパック配列）
  */
 import pako from 'pako';
 
@@ -29,12 +29,6 @@ export const GRID_ORIGIN_LAT = 24;
 
 // 座標量子化係数（経度180×1e7 < 2^31 なのでInt32に収まる）
 export const COORD_QUANT = 1e7;
-
-// Interval for placing label candidates along a line (in degrees, ~5km)
-const LABEL_CANDIDATE_INTERVAL = 0.05;
-
-// Minimum road length to generate labels (in meters, approximate)
-const LABEL_MIN_ROAD_LENGTH_M = 100;
 
 /**
  * グリッドセルの数値キー（文字列キーより高速）。col/rowは±512まで対応。
@@ -135,64 +129,6 @@ export function simplify(points, tol) {
   if (points.length <= 2) return points;
   const sq = tol * tol;
   return simplifyDouglasPeucker(simplifyRadial(points, sq), sq);
-}
-
-/**
- * Generate evenly-spaced label points along a LineString.
- * Short lines get one point at the midpoint.
- * Long lines get multiple points at regular intervals.
- * Returns an array of { position, angle }.
- */
-function getLinePoints(coordinates, interval) {
-  if (!coordinates || coordinates.length < 2) return [];
-
-  let totalLength = 0;
-  const segments = [];
-
-  for (let i = 0; i < coordinates.length - 1; i++) {
-    const [x1, y1] = coordinates[i];
-    const [x2, y2] = coordinates[i + 1];
-    const length = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
-    segments.push({ start: coordinates[i], end: coordinates[i + 1], length });
-    totalLength += length;
-  }
-
-  if (totalLength === 0) return [];
-
-  // 短い道路のラベルをスキップ（度→メートルの近似変換: 日本緯度帯で1°≈100km）
-  if (totalLength * 100_000 < LABEL_MIN_ROAD_LENGTH_M) return [];
-
-  // Determine how many points to place
-  const numPoints = Math.max(1, Math.round(totalLength / interval));
-  const spacing = totalLength / (numPoints + 1);
-
-  const points = [];
-
-  for (let p = 1; p <= numPoints; p++) {
-    const targetDist = spacing * p;
-    let accumulated = 0;
-
-    for (const seg of segments) {
-      if (accumulated + seg.length >= targetDist) {
-        const ratio = (targetDist - accumulated) / seg.length;
-        const x = seg.start[0] + (seg.end[0] - seg.start[0]) * ratio;
-        const y = seg.start[1] + (seg.end[1] - seg.start[1]) * ratio;
-
-        const dx = seg.end[0] - seg.start[0];
-        const dy = seg.end[1] - seg.start[1];
-        let angle = Math.atan2(dy, dx) * (180 / Math.PI);
-
-        if (angle > 90) angle -= 180;
-        if (angle < -90) angle += 180;
-
-        points.push({ position: [x, y], angle });
-        break;
-      }
-      accumulated += seg.length;
-    }
-  }
-
-  return points;
 }
 
 /**
@@ -395,26 +331,6 @@ export function processTier(bytes, fclass) {
     }
   }
 
-  // --- ラベル候補（名前付き道路のみ） ---
-  const candPos = [];
-  const candAngle = [];
-  const candFeature = [];
-  for (let pi = 0; pi < numParts; pi++) {
-    const fi = partFeature[pi];
-    if (!props[fi].name) continue;
-    for (const pt of getLinePoints(partsCoords[pi], LABEL_CANDIDATE_INTERVAL)) {
-      candPos.push(pt.position[0], pt.position[1]);
-      candAngle.push(pt.angle);
-      candFeature.push(fi);
-    }
-  }
-  const cand = {
-    pos: Float64Array.from(candPos),
-    angle: Float32Array.from(candAngle),
-    feature: Uint32Array.from(candFeature),
-    count: candFeature.length,
-  };
-
   const bundle = {
     fclass,
     numFeatures,
@@ -426,11 +342,9 @@ export function processTier(bytes, fclass) {
     partBBox,
     lods,
     cells,
-    cand,
   };
   bundle.transfer = [
     positions.buffer, partStart.buffer, partFeature.buffer, featurePartStart.buffer, partBBox.buffer,
-    cand.pos.buffer, cand.angle.buffer, cand.feature.buffer,
     ...lods.flatMap((l) => [l.positions.buffer, l.startIndices.buffer, l.pathFeature.buffer, l.pathBBox.buffer]),
     ...cells.flatMap((c) => [c.positions.buffer, c.startIndices.buffer, c.runFeature.buffer]),
   ];
