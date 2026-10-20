@@ -90,8 +90,8 @@ const LABEL_FONT_FAMILY = '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto S
 // [下限, 上限]: 下限 <= zoom < 上限 のときだけ表示する。上限を設けない場合は Infinity
 const SHIELD_ZOOM_RANGE = {
   motorway:  [5, Infinity],
-  trunk:     [9, Infinity],
-  primary:   [11, Infinity],
+  trunk:     [8, Infinity],
+  primary:   [10, Infinity],
   secondary: [11, Infinity],
 };
 
