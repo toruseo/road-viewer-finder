@@ -1,9 +1,8 @@
 /**
  * MapView - deck.gl + MapLibre GL JS integration
  *
- * 道路データはdataProcessorが生成したバイナリバンドル（Float32Arrayセグメント配列）
- * として受け取り、LineLayerのバイナリ属性で描画する。GeoJSONオブジェクトは保持せず、
- * テッセレーションも発生しないため、読み込み時のフリーズがない。
+ * 道路データはdataProcessorが生成したバイナリバンドル（フラット座標 + startIndices）
+ * として受け取り、PathLayerのバイナリモードで描画する。GeoJSONオブジェクトは保持しない。
  *
  * 描画は3段階のLOD:
  * - zoom < 8:           粗い簡略化ジオメトリ（全国1レイヤー/種別）
@@ -11,7 +10,7 @@
  * - zoom >= 10.5:       フル詳細（ビューポート内のグリッドセルのみレイヤー生成）
  */
 import maplibregl from 'maplibre-gl';
-import { PathLayer, TextLayer } from '@deck.gl/layers';
+import { PathLayer, TextLayer, IconLayer } from '@deck.gl/layers';
 import { COORDINATE_SYSTEM } from '@deck.gl/core';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import {
@@ -35,6 +34,12 @@ export const ROAD_STYLES = {
   primary:   { color: [25, 90, 50, 255], width: 3 },  // Green
   secondary: { color: [25, 90, 50, 255], width: 2 },  // Green, thinnest
 };
+// export const ROAD_STYLES = { //看板色に合わせたカラースキーム．TODO: 要調整
+//   motorway:  { color: [25, 128, 50, 255],  width: 6 },  // Green, thickest
+//   trunk:     { color: [50, 100, 220, 255], width: 4 },  // Blue
+//   primary:   { color: [128, 128, 128, 255], width: 3 },  // Gray
+//   secondary: { color: [128, 128, 128, 255], width: 2 },  // Gray, thinnest
+// };
 export const DEFAULT_ROAD_STYLE = { color: [128, 128, 128, 255], width: 1 };
 
 // Road layer definitions: array order = draw order (first = bottom, last = top)
@@ -52,8 +57,342 @@ const LABEL_TIER_ORDER = ['motorway', 'trunk', 'primary', 'secondary'];
 const LOD1_MIN_ZOOM = 8;     // これ未満はLOD0（粗）
 const DETAIL_MIN_ZOOM = 10.5; // これ以上はフル詳細（セル単位カリング）
 
-// Minimum spacing between labels in screen pixels
-const LABEL_MIN_SPACING_PX = 150;
+// --- 道路名ラベルの表示ズーム範囲（種別毎。ハイライト中の道路には適用しない） ---
+// [下限, 上限]: 下限 <= zoom < 上限 のときだけ配置する。上限を設けない場合は Infinity。
+// 縮小表示では下位種別のラベルは上位種別に押し出されてほぼ置かれないのに、
+// 全国分のパスの投影・チェーン構築の負荷だけが大きいので、置かれ始めるズームから対象にする
+const LABEL_ZOOM_RANGE = {
+  motorway:  [0, Infinity],
+  trunk:     [0, Infinity],
+  primary:   [7, Infinity],
+  secondary: [9, Infinity],
+};
+
+// --- 道路名ラベルの配置パラメータ（線に沿ったグリフ単位の配置） ---
+const LABEL_FONT_PX = 14;             // 文字サイズ
+const LABEL_SPACING_PX = 1200;        // 同一チェーン上のラベル間隔（画面上の弧長）
+const LABEL_SAME_NAME_MIN_PX = 250;   // 同一名称の最小間隔（並走チェーンの重複抑止）
+const LABEL_MIN_GAP_PX = 80;          // 道路名ラベル同士（名称を問わない）の最小距離。グリフ矩形の縁どうし
+// ハイライト中の道路の道路名ラベルは上の3つの代わりに以下を使い、密に置く（屈曲・重なりの判定は共通）
+const LABEL_HL_SPACING_PX = 300;
+const LABEL_HL_SAME_NAME_MIN_PX = 120;
+const LABEL_HL_MIN_GAP_PX = 20;
+const LABEL_HL_FONT_SCALE = 1.2;      // ハイライト中の道路の道路名ラベルの文字サイズ倍率（線からのオフセットも同倍率）
+const LABEL_HL_SNAP_PX = 8;           // ハイライト中の道路は画面上でこの距離以内の端点どうしもつないでチェーンにする（名称を問わない）
+const LABEL_HL_CLEAR_PX = 40;       // ハイライト中の道路の線からこの距離以内には、他の道路の道路名ラベルを置かない
+const LABEL_MAX_GLYPH_ANGLE_DEG = 25; // 隣接グリフ間で許容する進行方向の変化（屈曲部では置かない）
+const LABEL_LINE_OFFSET_PX = 10;      // 線の中心から文字中心までの垂直オフセット（線の上側に出す）
+const LABEL_TANGENT_WINDOW_PX = 7;    // 接線を取る弧長窓（±）。粗いLOD線の細かな折れに文字が反応しないよう文字サイズ程度にする
+const LABEL_SEARCH_STEP_PX = 10;      // 目標位置から前後へ探索する刻み
+const LABEL_FONT_FAMILY = '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif';
+
+// --- 路線番号シールドの表示ズーム範囲（種別毎） ---
+// [下限, 上限]: 下限 <= zoom < 上限 のときだけ表示する。上限を設けない場合は Infinity
+const SHIELD_ZOOM_RANGE = {
+  motorway:  [5, Infinity],
+  trunk:     [9, Infinity],
+  primary:   [11, Infinity],
+  secondary: [11, Infinity],
+};
+
+// --- 路線番号シールド（標識アイコン）の形状 ---
+// 図柄は道路標識の公式様式（標識令 別表第二）に基づく:
+//  高速道路:   高速道路ナンバリング標識（緑地に白の E 番号。角丸長方形）
+//  国道:       国道番号標識 118-A「おにぎり」。上辺が広い凸弧、長い斜辺が下端の丸い頂点へ絞る。
+//              Wikimedia Commons: Japanese_National_Route_Sign_0001.svg（PD）の輪郭パスを使用
+//  都道府県道: 都道府県道番号標識 118の2-A。左右が尖り上下が平らな角丸の正六角形（幅:高さ = 2:√3）
+const SHIELD_STYLES = {
+  motorway:  { shape: 'expressway',  color: '#1a7f3c' },
+  trunk:     { shape: 'national',    color: '#0140ff' },
+  primary:   { shape: 'prefectural', color: '#0040ff' },
+  secondary: { shape: 'prefectural', color: '#0040ff' },
+};
+// 形状毎のアイコン高さ、縦横比、番号中心の縦位置（上端0〜下端1）、番号が収まる幅の比率（その高さでの図形幅/全幅）、左右余白。
+// 縦横比は固定し、番号が収まらない場合は図形を伸ばさず文字サイズを下げる。
+// 角丸長方形（高速）だけは実標識と同様に文字数に応じて横幅が変わる（fixedWidth=false）
+const SHIELD_SHAPES = {
+  expressway:  { height: 22, aspect: 1.0,             textY: 0.5,  innerRatio: 1.0,  pad: 6, fixedWidth: false },
+  national:    { height: 22, aspect: 455 / 435,        textY: 0.4,  innerRatio: 0.66, pad: 2, fixedWidth: true },
+  prefectural: { height: 18, aspect: 2 / Math.sqrt(3), textY: 0.5,  innerRatio: 1.0,  pad: 6, fixedWidth: true },
+};
+// 国道番号標識の輪郭（Commons SVG の plate パス、座標系 0..455 x 0..435）
+const NATIONAL_SIGN_PATH = 'M 226.99991,425.39429 C 252.11645,425.39429 275.26756,415.76966 293.19578,399.78937 C 362.13553,330.75326 413.14928,244.91516 439.46426,150.46104 C 442.20297,142.16307 443.99982,131.7287 443.99982,120.87729 C 443.99982,76.02669 413.30428,38.28204 369.9794,27.07436 C 323.9411,15.75291 277.71818,9.99998 226.99992,9.99998 C 176.28166,9.99998 130.05873,15.75291 84.02044,27.07436 C 40.69555,38.28204 10.00001,76.02669 10.00001,120.87729 C 10.00001,131.7287 11.79686,142.16307 14.53557,150.46104 C 40.85055,244.91516 91.86431,330.75326 160.80406,399.78937 C 178.73227,415.76966 201.88339,425.39429 226.99991,425.39429 z';
+const SHIELD_FONT_PX = 9;           // 番号の文字サイズ（上限。形状に収まらない番号は縮小）
+const SHIELD_OVERLAP_PX = 6;        // 複数番号を横に並べるとき隣のアイコンと端を重ねる幅（後の番号が上に描かれる）
+const SHIELD_MARGIN_PX = 3;         // 衝突判定の余白
+const SHIELD_ICON_SCALE = 2;        // アトラス解像度（高DPI端末向け）
+
+// --- 路線番号シールドの配置パラメータ（ネットワークエッジラベリング） ---
+const SHIELD_SPACING_PX = 640;     // 同一チェーン上の配置間隔（画面上の弧長）
+const SHIELD_MIN_CHAIN_PX = 70;     // これより短いチェーンにはシールドを置かない
+const SHIELD_SAME_REF_MIN_PX = 150; // 同一路線番号の最小間隔（上下線分離など並走チェーンの重複抑止）
+const SHIELD_MIN_GAP_PX = 60;       // シールド同士（番号を問わない）の最小距離。衝突矩形の縁どうし（道路名ラベルとの間には適用しない）
+const SHIELD_MAX_BEND_DEG = 30;     // アイコン幅の範囲で許容する道路の方向変化（屈曲部を避ける）
+const SHIELD_SEARCH_STEP_PX = 6;    // 目標位置から前後へ探索する刻み
+
+/**
+ * 番号文字列の表示幅（ピクセル）を推定。ASCIIは0.6em、全角は1emとみなす。
+ */
+function shieldTextWidth(text) {
+  let w = 0;
+  for (const ch of text) w += ch.charCodeAt(0) < 128 ? 0.6 : 1.0;
+  return w * SHIELD_FONT_PX;
+}
+
+/**
+ * 形状と番号からアイコン幅（ピクセル）と番号の文字サイズを決める。
+ * 固定幅の形状では縦横比を保ち、番号が収まらない分だけ文字を縮める。
+ * @returns {{ w: number, fontSize: number }}
+ */
+function shieldFit(shape, text) {
+  const g = SHIELD_SHAPES[shape];
+  const natural = Math.round(g.height * g.aspect);
+  const tw = shieldTextWidth(text);
+  if (!g.fixedWidth) return { w: Math.max(natural, Math.ceil(tw + g.pad)), fontSize: SHIELD_FONT_PX };
+  const avail = natural * g.innerRatio - g.pad;
+  return { w: natural, fontSize: tw > avail ? SHIELD_FONT_PX * avail / tw : SHIELD_FONT_PX };
+}
+
+// 形状・幅ごとのSVGデータURLキャッシュ（IconLayerが自動的にアトラスへ詰める）
+const shieldIconCache = new Map();
+
+/**
+ * 白縁付きの標識図形をSVGデータURLとして生成する。{ id, url, width, height } を返す。
+ * 白縁は外側ストロークを先に描き、その上に本体を塗ることで作る（約2px）。
+ */
+function shieldIcon(shape, color, w) {
+  const id = `${shape}-${color}-${w}`;
+  let icon = shieldIconCache.get(id);
+  if (icon) return icon;
+  const h = SHIELD_SHAPES[shape].height;
+  let viewBox = `0 0 ${w} ${h}`;
+  let body;
+  let outer;
+  if (shape === 'expressway') {
+    body = `<rect x="2" y="2" width="${w - 4}" height="${h - 4}" rx="3"`;
+    outer = 4;
+  } else if (shape === 'national') {
+    // 公式輪郭を viewBox で引き伸ばして使う（幅を広げる場合は横方向にのみ伸びる）
+    viewBox = '-30 -30 515 495';
+    body = `<path d="${NATIONAL_SIGN_PATH}" stroke-linejoin="round"`;
+    outer = 70; // パス座標系での白縁幅（片側35 ≈ 2px）
+  } else {
+    // 左右が尖った六角形。角は stroke-linejoin=round で丸める
+    const m = 2;
+    const k = (h - 2 * m) / (2 * Math.sqrt(3));
+    const pts = `${m},${h / 2} ${m + k},${m} ${w - m - k},${m} ${w - m},${h / 2} ${w - m - k},${h - m} ${m + k},${h - m}`;
+    body = `<polygon points="${pts}" stroke-linejoin="round"`;
+    outer = 4;
+  }
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w * SHIELD_ICON_SCALE}" height="${h * SHIELD_ICON_SCALE}" viewBox="${viewBox}">` +
+    `${body} fill="none" stroke="#ffffff" stroke-width="${outer}"/>` +
+    `${body} fill="${color}" stroke="${color}" stroke-width="${outer * 0.3}"/>` +
+    `</svg>`;
+  icon = {
+    id,
+    url: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg),
+    width: w * SHIELD_ICON_SCALE,
+    height: h * SHIELD_ICON_SCALE,
+  };
+  shieldIconCache.set(id, icon);
+  return icon;
+}
+
+/**
+ * 軸平行矩形の衝突判定用の空間ハッシュ（固定格子）。矩形は [x0, y0, x1, y1]。
+ */
+class RectHash {
+  constructor(cellSize) {
+    this.cellSize = cellSize;
+    this.buckets = new Map();
+  }
+
+  _forEachBucket(r, fn) {
+    const s = this.cellSize;
+    for (let bx = Math.floor(r[0] / s); bx <= Math.floor(r[2] / s); bx++) {
+      for (let by = Math.floor(r[1] / s); by <= Math.floor(r[3] / s); by++) {
+        if (fn(`${bx},${by}`)) return true;
+      }
+    }
+    return false;
+  }
+
+  overlaps(r) {
+    return this._forEachBucket(r, (k) => {
+      const list = this.buckets.get(k);
+      if (!list) return false;
+      for (const o of list) {
+        if (r[0] < o[2] && r[2] > o[0] && r[1] < o[3] && r[3] > o[1]) return true;
+      }
+      return false;
+    });
+  }
+
+  insert(r) {
+    this._forEachBucket(r, (k) => {
+      let list = this.buckets.get(k);
+      if (!list) { list = []; this.buckets.set(k, list); }
+      list.push(r);
+      return false;
+    });
+  }
+}
+
+/**
+ * 同一路線番号のパス群を端点で連結し、分岐のない最大チェーン（ストローク）に組み上げる。
+ * 端点に接続するパスがちょうど2本（自分と相手1本）のときだけ延長し、分岐・合流・行き止まりで切る。
+ * 上下線分離区間のように同じ番号の2本が並走する場合はそれぞれ別チェーンになる。
+ * @param {Array<{pts: Float64Array, n: number, k0: string, k1: string}>} paths - 画面座標の折れ線と両端点キー
+ * @returns {Array<{pts: Float64Array, n: number, src: Uint32Array}>} src は各頂点の元パス番号
+ */
+function buildChains(paths) {
+  const node = new Map(); // 端点キー -> [{ i, end }]
+  const addNode = (key, i, end) => {
+    let list = node.get(key);
+    if (!list) { list = []; node.set(key, list); }
+    list.push({ i, end });
+  };
+  paths.forEach((p, i) => { addNode(p.k0, i, 0); addNode(p.k1, i, 1); });
+
+  const used = new Uint8Array(paths.length);
+  // item = { i, rev }: rev=true はチェーン方向に対して逆向きに辿る
+  const tailKey = (item) => (item.rev ? paths[item.i].k0 : paths[item.i].k1);
+  const extend = (start) => {
+    const out = [];
+    let cur = start;
+    for (;;) {
+      const inc = node.get(tailKey(cur));
+      if (!inc || inc.length !== 2) break;
+      const other = inc[0].i === cur.i ? inc[1] : inc[0];
+      if (other.i === cur.i || used[other.i]) break;
+      used[other.i] = 1;
+      cur = { i: other.i, rev: other.end === 1 };
+      out.push(cur);
+    }
+    return out;
+  };
+
+  const chains = [];
+  for (let i = 0; i < paths.length; i++) {
+    if (used[i]) continue;
+    used[i] = 1;
+    const fwd = extend({ i, rev: false });
+    const back = extend({ i, rev: true }).reverse().map((it) => ({ i: it.i, rev: !it.rev }));
+    const seq = [...back, { i, rev: false }, ...fwd];
+
+    let n = 0;
+    for (const it of seq) n += paths[it.i].n;
+    const pts = new Float64Array(n * 2);
+    const srcPath = new Uint32Array(n);
+    let v = 0;
+    for (const it of seq) {
+      const p = paths[it.i];
+      for (let j = 0; j < p.n; j++) {
+        const src = it.rev ? p.n - 1 - j : j;
+        const x = p.pts[src * 2];
+        const y = p.pts[src * 2 + 1];
+        if (v > 0 && pts[v * 2 - 2] === x && pts[v * 2 - 1] === y) continue; // 接続点の重複を除く
+        pts[v * 2] = x;
+        pts[v * 2 + 1] = y;
+        srcPath[v] = it.i;
+        v++;
+      }
+    }
+    chains.push({ pts, n: v, src: srcPath });
+  }
+  return chains;
+}
+
+/**
+ * 画面上で snapPx 以内にある端点どうしを近い順に1対1で結び、結んだ端点には共通のキー、
+ * 結ばない端点には固有のキーを k0/k1 として付け直す。buildChains に渡すと結んだ端点だけで連結される。
+ * ハイライト道路は名称の異なる区間（バイパス等）が途中の頂点で接して端点が一致しないことが多く、
+ * 端点キーの一致だけでは縮小表示時に数pxのチェーンに分断されるため、これで画面上の隙間を埋める。
+ */
+function snapEndpoints(paths, snapPx) {
+  const ends = []; // 端点番号 = パス番号 * 2 + (0: 始点, 1: 終点)
+  const grid = new Map();
+  paths.forEach((p, i) => {
+    for (const end of [0, 1]) {
+      const v = end === 0 ? 0 : p.n - 1;
+      const x = p.pts[v * 2], y = p.pts[v * 2 + 1];
+      ends.push([x, y]);
+      const g = `${Math.floor(x / snapPx)},${Math.floor(y / snapPx)}`;
+      let list = grid.get(g);
+      if (!list) { list = []; grid.set(g, list); }
+      list.push(i * 2 + end);
+    }
+  });
+  const cand = [];
+  for (let a = 0; a < ends.length; a++) {
+    const [x, y] = ends[a];
+    const gx = Math.floor(x / snapPx), gy = Math.floor(y / snapPx);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (const b of grid.get(`${gx + dx},${gy + dy}`) || []) {
+          if (b <= a || (a >> 1) === (b >> 1)) continue;
+          const d = Math.hypot(ends[b][0] - x, ends[b][1] - y);
+          if (d <= snapPx) cand.push([d, a, b]);
+        }
+      }
+    }
+  }
+  cand.sort((p, q) => p[0] - q[0]);
+  const key = new Array(ends.length);
+  for (const [, a, b] of cand) {
+    if (key[a] || key[b]) continue;
+    key[a] = key[b] = `s${a}`;
+  }
+  paths.forEach((p, i) => {
+    p.k0 = key[i * 2] || `u${i * 2}`;
+    p.k1 = key[i * 2 + 1] || `u${i * 2 + 1}`;
+  });
+}
+
+/**
+ * 弧長 s を含む線分の終点側の頂点番号（1..n-1）を返す。
+ */
+function segmentAt(cum, n, s) {
+  let lo = 1;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] < s) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * 折れ線の累積弧長を計算する。
+ */
+function cumulativeLength(chain) {
+  const cum = new Float64Array(chain.n);
+  for (let i = 1; i < chain.n; i++) {
+    const dx = chain.pts[i * 2] - chain.pts[i * 2 - 2];
+    const dy = chain.pts[i * 2 + 1] - chain.pts[i * 2 - 1];
+    cum[i] = cum[i - 1] + Math.hypot(dx, dy);
+  }
+  return cum;
+}
+
+/**
+ * 弧長 s の位置の座標を返す。
+ */
+function pointAt(chain, cum, s) {
+  let lo = 1;
+  let hi = chain.n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] < s) lo = mid + 1; else hi = mid;
+  }
+  const segLen = cum[lo] - cum[lo - 1];
+  const t = segLen > 0 ? (s - cum[lo - 1]) / segLen : 0;
+  return [
+    chain.pts[lo * 2 - 2] + (chain.pts[lo * 2] - chain.pts[lo * 2 - 2]) * t,
+    chain.pts[lo * 2 - 1] + (chain.pts[lo * 2 + 1] - chain.pts[lo * 2 - 1]) * t,
+  ];
+}
 
 // ホバー・クリックの当たり判定半径（描画線幅からの余裕、ピクセル）
 const PICKING_RADIUS_PX = 8;
@@ -87,7 +426,10 @@ export class MapView {
     this.map = null;
     this.deckOverlay = null;
     this.showLabels = true;
-    this.labelsData = [];           // Currently visible labels (filtered by viewport)
+    this.labelsData = [];           // 配置済みの道路名グリフ（ビューポート毎に再計算）
+    this._labelRects = [];          // 配置済み道路名グリフの画面矩形（シールド配置の障害物）
+    this.showShields = true;
+    this.shieldsData = [];          // Currently visible route-number shields (filtered by viewport)
     this.tooltip = null;
     this.tiers = new Map();         // fclass -> bundle (dataProcessor output)
     this._hiddenFclasses = new Set();
@@ -241,9 +583,13 @@ export class MapView {
     this._onMoveEnd = () => {
       let needUpdate = this._refreshViewportState();
 
-      // Re-filter labels
+      // Re-place labels (shields are placed after labels and avoid them)
       if (this.showLabels) {
-        this.labelsData = this.filterLabelsForViewport();
+        this.labelsData = this.placeLabels();
+        needUpdate = true;
+      }
+      if (this.showShields) {
+        this.shieldsData = this.placeShields();
         needUpdate = true;
       }
 
@@ -277,11 +623,12 @@ export class MapView {
     const numRuns = bundle.cells.reduce((sum, c) => sum + c.numRuns, 0);
     console.log(`Tier ${fclass}: ${bundle.numFeatures} features, ` +
       `${bundle.cells.length} cells, ${numRuns} runs, ` +
-      `${bundle.cand.count} label candidates`);
+      `${bundle.lods.map((l) => l.numPaths).join('/')} lod paths`);
 
     this._refreshViewportState();
     this._roadLayers = null;
     this.labelsData = [];
+    this.shieldsData = [];
     this.updateLayers();
   }
 
@@ -428,43 +775,7 @@ export class MapView {
 
     const layers = [...this._roadLayers];
 
-    // Add labels if enabled
-    if (this.showLabels) {
-      // Filter by viewport pixels if not already done
-      if (this.labelsData.length === 0) {
-        this.labelsData = this.filterLabelsForViewport();
-      }
-
-      const labelSize = 14;
-      const textLayer = new TextLayer({
-        id: 'road-labels',
-        data: this.labelsData,
-        getPosition: d => d.position,
-        getText: d => d.label,
-        getAngle: d => d.angle,
-        getSize: labelSize,
-        getColor: [0, 0, 0, 255],
-        getTextAnchor: 'middle',
-        getAlignmentBaseline: 'center',
-        getPixelOffset: d => {
-          const rad = d.angle * Math.PI / 180;
-          return [-labelSize*0.9 * Math.sin(rad), -labelSize*0.9 * Math.cos(rad)];
-        },
-        fontFamily: '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "Yu Gothic", "Meiryo", sans-serif',
-        fontWeight: 'bold',
-        outlineWidth: 0,
-        billboard: false,
-        sizeUnits: 'pixels',
-        sizeMinPixels: 12,
-        sizeMaxPixels: 18,
-        pickable: false,
-        characterSet: 'auto'
-      });
-
-      layers.push(textLayer);
-    }
-
-    // Add highlight layer if there are highlighted features
+    // Add highlight layer if there are highlighted features（道路名ラベルより下に描く）
     if (this._highlight && this._highlight.numPaths > 0) {
       layers.push(new PathLayer({
         id: 'highlight-layer',
@@ -489,6 +800,77 @@ export class MapView {
       }));
     }
 
+    // Add labels if enabled
+    if (this.showLabels) {
+      // Place labels if not already done for this viewport
+      if (this.labelsData.length === 0) {
+        this.labelsData = this.placeLabels();
+      }
+
+      // 1要素 = 1グリフ。位置・角度・線からのオフセットは placeLabels が曲線に沿って決めている
+      const textLayer = new TextLayer({
+        id: 'road-labels',
+        data: this.labelsData,
+        getPosition: d => d.position,
+        getText: d => d.text,
+        getAngle: d => d.angle,
+        getSize: d => d.size,
+        getColor: [0, 0, 0, 255],
+        getTextAnchor: 'middle',
+        getAlignmentBaseline: 'center',
+        getPixelOffset: d => d.offset,
+        fontFamily: LABEL_FONT_FAMILY,
+        fontWeight: 'bold',
+        // 極薄の白アウトライン（SDF必須）。アトラス解像度を上げ、smoothing（SDFのアンチエイリアス幅）も
+        // 表示縮小率に合わせて広げないとエッジがギザつく。outlineWidth はアトラスのフォントサイズ基準:
+        // 表示14pxでは 5 * 14/96 ≈ 0.7px
+        fontSettings: { sdf: true, fontSize: 96, buffer: 8, radius: 20, smoothing: 0.3 },
+        outlineWidth: 5,
+        outlineColor: [255, 255, 255, 255],
+        billboard: false,
+        sizeUnits: 'pixels',
+        pickable: false,
+        characterSet: 'auto'
+      });
+
+      layers.push(textLayer);
+    }
+
+    // 路線番号アイコン（図形 + 番号テキスト）。最前面に置く
+    if (this.showShields) {
+      if (this.shieldsData.length === 0) {
+        this.shieldsData = this.placeShields();
+      }
+      layers.push(new IconLayer({
+        id: 'route-shields',
+        data: this.shieldsData,
+        getPosition: d => d.position,
+        getIcon: d => d.icon,
+        getSize: d => d.h,
+        getPixelOffset: d => d.offset,
+        sizeUnits: 'pixels',
+        billboard: true,
+        pickable: false,
+      }));
+      layers.push(new TextLayer({
+        id: 'route-shield-text',
+        data: this.shieldsData,
+        getPosition: d => d.position,
+        getText: d => d.text,
+        getSize: d => d.fontSize,
+        getColor: [255, 255, 255, 255],
+        getPixelOffset: d => d.textOffset,
+        getTextAnchor: 'middle',
+        getAlignmentBaseline: 'center',
+        fontFamily: 'Arial, "Helvetica Neue", "Noto Sans JP", sans-serif',
+        fontWeight: 'bold',
+        outlineWidth: 0,
+        sizeUnits: 'pixels',
+        pickable: false,
+        characterSet: 'auto',
+      }));
+    }
+
     this.deckOverlay.setProps({ layers });
   }
 
@@ -499,6 +881,17 @@ export class MapView {
   setLabelsVisible(visible) {
     this.showLabels = visible;
     this.labelsData = []; // Reset filtered labels so they get recalculated
+    this.shieldsData = []; // シールドは道路名ラベルを避けて置くので再計算
+    this.updateLayers();
+  }
+
+  /**
+   * Toggle route-number shield visibility
+   * @param {boolean} visible
+   */
+  setShieldsVisible(visible) {
+    this.showShields = visible;
+    this.shieldsData = [];
     this.updateLayers();
   }
 
@@ -524,79 +917,444 @@ export class MapView {
       this._hiddenFclasses.add(fclass);
     }
     this.labelsData = [];
+    this.shieldsData = [];
     this._roadLayers = null;
     this.updateLayers();
   }
 
   /**
-   * Filter label candidates by screen-pixel spacing.
-   * Projects each candidate to screen coordinates and uses a grid to ensure
-   * no two labels are closer than LABEL_MIN_SPACING_PX pixels.
-   * ハイライト中の道路の候補を最優先で配置し、以降は道路種別の重要度順。
+   * ビューポートの経緯度範囲（bboxによるパス抽出用。少し広げて端のパスも拾う）。
    */
-  filterLabelsForViewport() {
+  _viewBox() {
+    const b = this.map.getBounds();
+    return { west: b.getWest() - 0.02, east: b.getEast() + 0.02, south: b.getSouth() - 0.02, north: b.getNorth() + 0.02 };
+  }
+
+  /**
+   * 道路名ラベルを線に沿ったグリフ配置（MapLibre の line placement 相当）で決める。
+   * 1. ビューポート内のパスを画面座標に投影してチェーンに組む（buildChains）。
+   *    ハイライト中の道路は名称・種別を問わず全区間をまとめ、画面上で近い端点もつなぐ（snapEndpoints）。
+   *    各位置にはその位置の区間の名称を表示する。
+   *    その他の道路は種別優先順に、同一名称ごとに端点で連結して分岐のないチェーンにする
+   * 2. 長いチェーンから順に、弧長に沿って LABEL_SPACING_PX（ハイライト中の道路は LABEL_HL_*）間隔の目標位置を取り、前後を探索して
+   *    文字列全体を曲線上に載せる。各文字は曲線上の位置と接線角で個別に置き、
+   *    隣接文字の角度差が閾値超（屈曲部）、同一名称の既配置に近い、
+   *    いずれかの文字が既配置ラベルと重なる、のどれかなら不採用
+   * 3. 文字列の向きは読み下ろし（右→左）にならないよう中央の接線方向で決める
+   * 配置したグリフ矩形は this._labelRects に残し、シールド配置が障害物として参照する。
+   * @returns {Array<{position, text, angle, offset, size}>} グリフ配列
+   */
+  placeLabels() {
+    this._labelRects = [];
     if (!this.map || this.tiers.size === 0) return [];
 
-    const bounds = this.map.getBounds();
-    const padding = 0.01;
-    const west = bounds.getWest() - padding;
-    const east = bounds.getEast() + padding;
-    const south = bounds.getSouth() - padding;
-    const north = bounds.getNorth() + padding;
+    const proj = this._screenProjector();
+    const box = this._viewBox();
+    const edge = 40;
+    const obstacles = new RectHash(64);
+    const placedByName = new Map(); // name -> [x, y, ...]
+    const maxGlyphCos = Math.cos(LABEL_MAX_GLYPH_ANGLE_DEG * Math.PI / 180);
+    const glyphs = [];
 
-    const cellSize = LABEL_MIN_SPACING_PX;
-    const occupied = new Set();
-    const labels = [];
-
-    const tryCandidate = (tier, i) => {
-      const lng = tier.cand.pos[i * 2];
-      const lat = tier.cand.pos[i * 2 + 1];
-
-      // Skip candidates outside the viewport
-      if (lng < west || lng > east || lat < south || lat > north) return;
-
-      // Project geographic coordinates to screen pixels
-      const pixel = this.map.project([lng, lat]);
-      const cellX = Math.floor(pixel.x / cellSize);
-      const cellY = Math.floor(pixel.y / cellSize);
-
-      // Check 3x3 neighborhood for already-placed labels
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          if (occupied.has(`${cellX + dx},${cellY + dy}`)) return;
-        }
-      }
-
-      labels.push({
-        position: [lng, lat],
-        angle: tier.cand.angle[i],
-        label: tier.props[tier.cand.feature[i]].name,
-      });
-      occupied.add(`${cellX},${cellY}`);
+    // 接線（単位ベクトル）: 弧長 s の前後 LABEL_TANGENT_WINDOW_PX の差分
+    const tangentAt = (chain, cum, s, len) => {
+      const a = pointAt(chain, cum, Math.max(0, s - LABEL_TANGENT_WINDOW_PX));
+      const b = pointAt(chain, cum, Math.min(len, s + LABEL_TANGENT_WINDOW_PX));
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const l = Math.hypot(dx, dy) || 1;
+      return [dx / l, dy / l];
     };
 
-    // Process highlighted roads' candidates first
+    // 文字列を弧長 sCenter を中心に置けるか試す。置ければグリフ配列と矩形配列を返す
+    const tryLabel = (chain, cum, len, sCenter, chars, adv, textLen, gap, zone, fontPx) => {
+      const glyphHalf = fontPx / 2 + 1; // グリフの衝突矩形（回転を考慮して正方形）
+      const lineOffset = LABEL_LINE_OFFSET_PX * fontPx / LABEL_FONT_PX;
+      const [tx, ty] = tangentAt(chain, cum, sCenter, len);
+      // 読み方向: 右向き（tx>0）。真縦なら下→上（ty<0）に読む
+      const dir = Math.abs(tx) < 1e-6 ? (ty < 0 ? 1 : -1) : (tx > 0 ? 1 : -1);
+      // 弧長 s のグリフ: 中心線上の点、読み方向の接線、線の上側（画面上方向）へオフセットした文字中心
+      const glyphAt = (s) => {
+        const p = pointAt(chain, cum, s);
+        const t0 = tangentAt(chain, cum, s, len);
+        const t = [t0[0] * dir, t0[1] * dir];
+        const n = [t[1], -t[0]];
+        return { s, p, t, n, cx: p[0] + n[0] * lineOffset, cy: p[1] + n[1] * lineOffset };
+      };
+      const items = [];
+      const rects = [];
+      let prev = null;
+      let sg = sCenter - dir * (textLen / 2 - adv[0] / 2);
+      for (let i = 0; i < chars.length; i++) {
+        if (prev) {
+          // 次の文字の弧長。オフセット曲線上では中心線より間隔が伸縮するので、
+          // 文字中心間の画面距離が所望の送り幅になるよう弧長を補正する
+          const want = (adv[i - 1] + adv[i]) / 2;
+          sg = prev.s + dir * want;
+          for (let k = 0; k < 2; k++) {
+            const g = glyphAt(Math.min(len, Math.max(0, sg)));
+            const d = Math.hypot(g.cx - prev.cx, g.cy - prev.cy);
+            if (d < 1e-3) break;
+            sg = prev.s + (sg - prev.s) * (want / d);
+          }
+        }
+        if (sg < 0 || sg > len) return null;
+        const g = glyphAt(sg);
+        if (prev && prev.t[0] * g.t[0] + prev.t[1] * g.t[1] < maxGlyphCos) return null;
+        const rect = [g.cx - glyphHalf, g.cy - glyphHalf, g.cx + glyphHalf, g.cy + glyphHalf];
+        // 既配置ラベルとの最小距離: 判定時だけ矩形を gap 広げる（登録は元の矩形）
+        if (obstacles.overlaps([rect[0] - gap, rect[1] - gap, rect[2] + gap, rect[3] + gap])) return null;
+        if (zone && zone.overlaps(rect)) return null;
+        rects.push(rect);
+        items.push({
+          position: [proj.lng(g.p[0]), proj.lat(g.p[1])],
+          text: chars[i],
+          angle: -Math.atan2(g.t[1], g.t[0]) * 180 / Math.PI,
+          offset: [g.n[0] * lineOffset, g.n[1] * lineOffset],
+          size: fontPx,
+        });
+        prev = g;
+      }
+      return { items, rects };
+    };
+
+    // ハイライト中の道路のパス（全種別、名称なしも含む）。p.name は名称（なければ null）
+    const NO_NAME = '\u0000';
+    const hlPaths = [];
     if (this._highlight) {
       for (const fclass of LABEL_TIER_ORDER) {
-        const matched = this._highlight.sets.get(fclass);
         const tier = this.tiers.get(fclass);
-        if (!matched || !tier || this._hiddenFclasses.has(fclass)) continue;
-        for (let i = 0; i < tier.cand.count; i++) {
-          if (matched.has(tier.cand.feature[i])) tryCandidate(tier, i);
+        const hl = this._highlight.sets.get(fclass);
+        if (!tier || !hl || this._hiddenFclasses.has(fclass)) continue;
+        const groups = this._collectPaths(tier, box, proj, (fi) => (hl.has(fi) ? (tier.props[fi].name || NO_NAME) : null));
+        for (const [key, paths] of groups) {
+          for (const p of paths) {
+            p.name = key === NO_NAME ? null : key;
+            hlPaths.push(p);
+          }
         }
       }
     }
 
-    // Then regular candidates in road-importance order
+    // ハイライト中の道路の線の周囲（LABEL_HL_CLEAR_PX）。線に沿って step 間隔で正方形を登録する
+    let hlZone = null;
+    if (hlPaths.length > 0) {
+      hlZone = new RectHash(64);
+      const c = LABEL_HL_CLEAR_PX;
+      const step = c / 2;
+      for (const { pts, n } of hlPaths) {
+        for (let v = 0; v < n - 1; v++) {
+          const x0 = pts[v * 2], y0 = pts[v * 2 + 1];
+          const dx = pts[v * 2 + 2] - x0, dy = pts[v * 2 + 3] - y0;
+          const k = Math.max(1, Math.ceil(Math.hypot(dx, dy) / step));
+          for (let j = 0; j <= k; j++) {
+            const x = x0 + dx * j / k, y = y0 + dy * j / k;
+            if (x < -c || x > proj.width + c || y < -c || y > proj.height + c) continue;
+            hlZone.insert([x - c, y - c, x + c, y + c]);
+          }
+        }
+      }
+    }
+
+    // ハイライト中の道路とその他の道路で使い分ける配置規則
+    const ruleOf = (highlighted) => {
+      const fontPx = highlighted ? LABEL_FONT_PX * LABEL_HL_FONT_SCALE : LABEL_FONT_PX;
+      const sameNameMin = highlighted ? LABEL_HL_SAME_NAME_MIN_PX : LABEL_SAME_NAME_MIN_PX;
+      const metrics = new Map(); // name -> { chars, adv, textLen }
+      return {
+        spacing: highlighted ? LABEL_HL_SPACING_PX : LABEL_SPACING_PX,
+        sameNameMinSq: sameNameMin * sameNameMin,
+        gap: highlighted ? LABEL_HL_MIN_GAP_PX : LABEL_MIN_GAP_PX,
+        zone: highlighted ? null : hlZone,
+        fontPx,
+        metrics: (name) => {
+          let m = metrics.get(name);
+          if (!m) {
+            const chars = [...name];
+            const adv = chars.map(c => (c.charCodeAt(0) < 128 ? 0.6 : 1.0) * fontPx);
+            m = { chars, adv, textLen: adv.reduce((a, b) => a + b, 0) };
+            metrics.set(name, m);
+          }
+          return m;
+        },
+      };
+    };
+
+    // チェーン上に rule.spacing 間隔の目標位置を取り、各目標位置の前後を探索してラベルを1つずつ置く。
+    // nameAt(s) は弧長 s の位置に表示する名称（null の位置には置かない）
+    const labelChain = (chain, cum, length, nameAt, rule) => {
+      const count = Math.max(1, Math.round(length / rule.spacing));
+      for (let i = 0; i < count; i++) {
+        const target = length * (i + 0.5) / count;
+        const maxOffset = Math.min(rule.spacing / 3, length / (2 * count));
+        let done = false;
+        for (let off = 0; off <= maxOffset && !done; off += LABEL_SEARCH_STEP_PX) {
+          for (const sign of (off === 0 ? [1] : [1, -1])) {
+            const s = target + sign * off;
+            const name = nameAt(s);
+            if (!name) continue;
+            const { chars, adv, textLen } = rule.metrics(name);
+            const endMargin = textLen / 2 + 6;
+            if (s < endMargin || s > length - endMargin) continue;
+            const [x, y] = pointAt(chain, cum, s);
+            if (x < -edge || x > proj.width + edge || y < -edge || y > proj.height + edge) continue;
+
+            let placed = placedByName.get(name);
+            if (!placed) { placed = []; placedByName.set(name, placed); }
+            let tooClose = false;
+            for (let j = 0; j < placed.length; j += 2) {
+              const dx = x - placed[j], dy = y - placed[j + 1];
+              if (dx * dx + dy * dy < rule.sameNameMinSq) { tooClose = true; break; }
+            }
+            if (tooClose) { done = true; break; } // 並走する別チェーンで既に充足
+
+            const res = tryLabel(chain, cum, length, s, chars, adv, textLen, rule.gap, rule.zone, rule.fontPx);
+            if (!res) continue;
+            for (const r of res.rects) obstacles.insert(r);
+            this._labelRects.push(...res.rects);
+            placed.push(x, y);
+            glyphs.push(...res.items);
+            done = true;
+            break;
+          }
+        }
+      }
+    };
+
+    const chainsOf = (paths) => buildChains(paths).map((c) => {
+      const cum = cumulativeLength(c);
+      return { chain: c, cum, length: cum[c.n - 1] };
+    }).filter((c) => c.length > 0).sort((a, b) => b.length - a.length);
+
+    // 1. ハイライト中の道路: 名称・種別を問わず全区間を1つの網としてチェーンに組み、
+    //    各位置にはその位置の区間の名称を表示する
+    if (hlPaths.length > 0) {
+      const hlRule = ruleOf(true);
+      snapEndpoints(hlPaths, LABEL_HL_SNAP_PX);
+      for (const { chain, cum, length } of chainsOf(hlPaths)) {
+        labelChain(chain, cum, length, (s) => hlPaths[chain.src[segmentAt(cum, chain.n, s)]].name, hlRule);
+      }
+    }
+
+    // 2. その他の道路: 種別優先順に、同一名称ごとにチェーンを組む
+    const rule = ruleOf(false);
+    const zoom = this.map.getZoom();
     for (const fclass of LABEL_TIER_ORDER) {
       const tier = this.tiers.get(fclass);
       if (!tier || this._hiddenFclasses.has(fclass)) continue;
-      for (let i = 0; i < tier.cand.count; i++) {
-        tryCandidate(tier, i);
+      const [minZoom, maxZoom] = LABEL_ZOOM_RANGE[fclass];
+      if (zoom < minZoom || zoom >= maxZoom) continue;
+      const hl = this._highlight ? this._highlight.sets.get(fclass) : null;
+      const groups = this._collectPaths(tier, box, proj, (fi) => (hl && hl.has(fi) ? null : tier.props[fi].name || null));
+      for (const [name, paths] of groups) {
+        const { textLen } = rule.metrics(name);
+        for (const { chain, cum, length } of chainsOf(paths).filter((c) => c.length >= textLen + 12)) {
+          labelChain(chain, cum, length, () => name, rule);
+        }
       }
     }
 
-    return labels;
+    return glyphs;
+  }
+
+  /**
+   * 現在のビュー（回転・傾きなし）に対する Web メルカトル投影。
+   * map.project() と同じ結果を関数呼び出しのオーバーヘッドなしで大量の頂点に適用するためのもの。
+   */
+  _screenProjector() {
+    const zoom = this.map.getZoom();
+    const c = this.map.getCenter();
+    const worldSize = 512 * Math.pow(2, zoom);
+    const el = this.map.getContainer();
+    const width = el.clientWidth;
+    const height = el.clientHeight;
+    const mercY = (lat) => (1 - Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)) / Math.PI) / 2 * worldSize;
+    const cx = (c.lng + 180) / 360 * worldSize - width / 2;
+    const cy = mercY(c.lat) - height / 2;
+    return {
+      width, height,
+      x: (lng) => (lng + 180) / 360 * worldSize - cx,
+      y: (lat) => mercY(lat) - cy,
+      lng: (x) => (x + cx) / worldSize * 360 - 180,
+      lat: (y) => Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + cy) / worldSize))) * 180 / Math.PI,
+    };
+  }
+
+  /**
+   * ビューポートに掛かるパスを画面座標の折れ線として集め、keyOf(featureIndex) の返す文字列で分類する
+   * （道路名ラベルなら name、路線番号なら ref）。keyOf が null を返す feature は対象外。
+   * 現在のLOD段階に応じて簡略化ジオメトリ（低・中ズーム）またはフル詳細（高ズーム）を使う。
+   * 端点キーはLOD段階毎の元座標値から作るので、同じ地点で終わるパス同士は同じキーになる。
+   * @returns {Map<string, Array>} key -> パス配列 [{ pts, n, k0, k1 }]
+   */
+  _collectPaths(tier, box, proj, keyOf) {
+    const groups = new Map();
+    const push = (key, path) => {
+      let list = groups.get(key);
+      if (!list) { list = []; groups.set(key, list); }
+      list.push(path);
+    };
+    const level = this._lodLevel;
+    if (level < 2) {
+      const lod = tier.lods[level];
+      const pos = lod.positions;
+      const bb = lod.pathBBox;
+      for (let p = 0; p < lod.numPaths; p++) {
+        if (bb[p * 4 + 2] < box.west || bb[p * 4] > box.east || bb[p * 4 + 3] < box.south || bb[p * 4 + 1] > box.north) continue;
+        const ref = keyOf(lod.pathFeature[p]);
+        if (!ref) continue;
+        const s = lod.startIndices[p];
+        const n = lod.startIndices[p + 1] - s;
+        const pts = new Float64Array(n * 2);
+        for (let v = 0; v < n; v++) {
+          pts[v * 2] = proj.x(pos[(s + v) * 2]);
+          pts[v * 2 + 1] = proj.y(pos[(s + v) * 2 + 1]);
+        }
+        const e = s + n - 1;
+        push(ref, { pts, n, k0: `${pos[s * 2]},${pos[s * 2 + 1]}`, k1: `${pos[e * 2]},${pos[e * 2 + 1]}` });
+      }
+    } else {
+      const pos = tier.positions;
+      const bb = tier.partBBox;
+      const numParts = tier.partFeature.length;
+      for (let pi = 0; pi < numParts; pi++) {
+        if (bb[pi * 4 + 2] < box.west || bb[pi * 4] > box.east || bb[pi * 4 + 3] < box.south || bb[pi * 4 + 1] > box.north) continue;
+        const ref = keyOf(tier.partFeature[pi]);
+        if (!ref) continue;
+        const s = tier.partStart[pi];
+        const n = tier.partStart[pi + 1] - s;
+        if (n < 2) continue;
+        const pts = new Float64Array(n * 2);
+        for (let v = 0; v < n; v++) {
+          pts[v * 2] = proj.x(pos[(s + v) * 2] / COORD_QUANT);
+          pts[v * 2 + 1] = proj.y(pos[(s + v) * 2 + 1] / COORD_QUANT);
+        }
+        const e = s + n - 1;
+        push(ref, { pts, n, k0: `${pos[s * 2]},${pos[s * 2 + 1]}`, k1: `${pos[e * 2]},${pos[e * 2 + 1]}` });
+      }
+    }
+    return groups;
+  }
+
+  /**
+   * 路線番号シールドをネットワークエッジのラベリングとして配置する。
+   * 1. 種別優先順に、ビューポート内の ref 付きパスを画面座標に投影し、同一番号ごとに
+   *    端点で連結して分岐のないチェーンに組む（buildChains）
+   * 2. 長いチェーンから順に、画面上の弧長に沿って SHIELD_SPACING_PX 間隔の目標位置を取り、
+   *    各目標位置の前後を探索して「屈曲していない・端に寄りすぎない・同一番号の既配置から
+   *    十分離れている・他のシールドや道路名ラベルと重ならない」最初の位置に置く
+   * 複数番号（';'区切り）は1点に端を重ねて横並びで配置し、矩形は群全体で判定する。
+   * @returns {Array<{position, icon, h, offset, textOffset, text}>}
+   */
+  placeShields() {
+    if (!this.map || this.tiers.size === 0) return [];
+
+    const zoom = this.map.getZoom();
+    const proj = this._screenProjector();
+    const box = this._viewBox();
+    // 画面端の少し外側まで配置対象にして、パン時に端で急に出現するのを減らす
+    const edge = 40;
+
+    // 配置済みの道路名ラベル（グリフ矩形）を障害物として登録
+    const obstacles = new RectHash(64);
+    if (this.showLabels) {
+      for (const r of this._labelRects) obstacles.insert(r);
+    }
+    // 配置済みシールドのみ（SHIELD_MIN_GAP_PX の判定用）
+    const placedShields = new RectHash(64);
+
+    const placedByRef = new Map(); // `${fclass}|${ref}` -> [x, y, x, y, ...]
+    const sameRefMinSq = SHIELD_SAME_REF_MIN_PX * SHIELD_SAME_REF_MIN_PX;
+    const maxBendCos = Math.cos(SHIELD_MAX_BEND_DEG * Math.PI / 180);
+    const shields = [];
+
+    for (const fclass of LABEL_TIER_ORDER) {
+      const tier = this.tiers.get(fclass);
+      if (!tier || this._hiddenFclasses.has(fclass)) continue;
+      const [minZoom, maxZoom] = SHIELD_ZOOM_RANGE[fclass];
+      if (zoom < minZoom || zoom >= maxZoom) continue;
+      const style = SHIELD_STYLES[fclass];
+      const h = SHIELD_SHAPES[style.shape].height;
+      const textDy = (SHIELD_SHAPES[style.shape].textY - 0.5) * h;
+
+      for (const [ref, paths] of this._collectPaths(tier, box, proj, (fi) => tier.props[fi].ref || null)) {
+        const refs = ref.split(';').map(r => r.trim()).filter(Boolean);
+        if (refs.length === 0) continue;
+        const fits = refs.map(r => shieldFit(style.shape, r));
+        const total = fits.reduce((a, f) => a + f.w, 0) - SHIELD_OVERLAP_PX * (refs.length - 1);
+        const halfW = total / 2;
+        const key = `${fclass}|${ref}`;
+        let placed = placedByRef.get(key);
+        if (!placed) { placed = []; placedByRef.set(key, placed); }
+
+        const chains = buildChains(paths).map((c) => {
+          const cum = cumulativeLength(c);
+          return { chain: c, cum, length: cum[c.n - 1] };
+        }).filter((c) => c.length >= SHIELD_MIN_CHAIN_PX).sort((a, b) => b.length - a.length);
+
+        for (const { chain, cum, length } of chains) {
+          const count = Math.max(1, Math.round(length / SHIELD_SPACING_PX));
+          const endMargin = halfW + 4;
+          for (let i = 0; i < count; i++) {
+            const target = length * (i + 0.5) / count;
+            const maxOffset = Math.min(SHIELD_SPACING_PX / 3, length / (2 * count));
+            for (let off = 0; off <= maxOffset; off += SHIELD_SEARCH_STEP_PX) {
+              let done = false;
+              for (const sign of (off === 0 ? [1] : [1, -1])) {
+                const s = target + sign * off;
+                if (s < endMargin || s > length - endMargin) continue;
+                const [x, y] = pointAt(chain, cum, s);
+                if (x < -edge || x > proj.width + edge || y < -edge || y > proj.height + edge) continue;
+
+                // 屈曲チェック: アイコン幅の前後での進行方向の変化
+                const a = pointAt(chain, cum, s - halfW);
+                const b = pointAt(chain, cum, s + halfW);
+                const ux = x - a[0], uy = y - a[1];
+                const vx = b[0] - x, vy = b[1] - y;
+                const lu = Math.hypot(ux, uy), lv = Math.hypot(vx, vy);
+                if (lu > 0 && lv > 0 && (ux * vx + uy * vy) / (lu * lv) < maxBendCos) continue;
+
+                // 同一番号の既配置（並走チェーン等）との最小間隔
+                let tooClose = false;
+                for (let j = 0; j < placed.length; j += 2) {
+                  const dx = x - placed[j], dy = y - placed[j + 1];
+                  if (dx * dx + dy * dy < sameRefMinSq) { tooClose = true; break; }
+                }
+                if (tooClose) { done = true; break; } // この目標位置は並走する別チェーンで既に充足
+
+                const rect = [x - halfW - SHIELD_MARGIN_PX, y - h / 2 - SHIELD_MARGIN_PX, x + halfW + SHIELD_MARGIN_PX, y + h / 2 + SHIELD_MARGIN_PX];
+                if (obstacles.overlaps(rect)) continue;
+                const gap = SHIELD_MIN_GAP_PX;
+                if (placedShields.overlaps([rect[0] - gap, rect[1] - gap, rect[2] + gap, rect[3] + gap])) continue;
+
+                obstacles.insert(rect);
+                placedShields.insert(rect);
+                placed.push(x, y);
+                const position = [proj.lng(x), proj.lat(y)];
+                let ox = -halfW;
+                for (let j = 0; j < refs.length; j++) {
+                  const { w, fontSize } = fits[j];
+                  shields.push({
+                    position,
+                    icon: shieldIcon(style.shape, style.color, w),
+                    h,
+                    fontSize,
+                    offset: [ox + w / 2, 0],
+                    textOffset: [ox + w / 2, textDy],
+                    text: refs[j],
+                  });
+                  ox += w - SHIELD_OVERLAP_PX;
+                }
+                done = true;
+                break;
+              }
+              if (done) break;
+            }
+          }
+        }
+      }
+    }
+
+    return shields;
   }
 
   /**
@@ -755,6 +1513,7 @@ export class MapView {
 
     this._highlight = { positions, startIndices, numPaths, sets };
     this.labelsData = [];
+    this.shieldsData = [];
     this.updateLayers();
 
     // Fit to highlighted features
@@ -778,6 +1537,7 @@ export class MapView {
   clearHighlight() {
     this._highlight = null;
     this.labelsData = [];
+    this.shieldsData = [];
     this.updateLayers();
   }
 

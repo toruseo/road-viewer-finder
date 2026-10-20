@@ -18,29 +18,26 @@ No test framework or linter is configured. ユーザが `npm run dev` を常時�
 ## Frameworks
 
 - **Build**: Vite
-- **Render**: deck.gl (GeoJsonLayer, TextLayer) + MapLibre GL JS
+- **Render**: deck.gl (PathLayer, TextLayer, IconLayer) + MapLibre GL JS
 
 ## Architecture
 
-The app has four active source files with clear responsibilities:
-
-- **`src/main.js`** - `App` class: UI wiring (search panel, label toggle, help modal, legend), per-fclass data loading (fetch with progress display → Web Worker processing). Imports README.md as raw text (`?raw`) and renders it as the help modal content via `marked`.
-- **`src/dataProcessor.js`** - Pure functions: gzip decompression (pako), GeoJSON parse, and conversion to binary bundles (Float32Array segment arrays, quantized Int32 master coordinates, LOD simplification via Douglas-Peucker, grid-cell partitioning, label candidates). Used by the worker, and as a main-thread fallback when Workers are unavailable.
-- **`src/dataWorker.js`** - Web Worker entry: runs `processTier` off the main thread and transfers the resulting TypedArrays back (zero-copy). Imported via `?worker&inline` so the release zip's single-file HTML keeps working.
-- **`src/MapView.js`** - `MapView` class: All map/rendering logic. Manages deck.gl `MapboxOverlay` with binary-mode `PathLayer`s (roads + yellow search highlight; rounded joints/caps for continuous-looking polylines) and a `TextLayer` (labels). Handles LOD switching, viewport cell culling, label filtering with pixel-space deduplication, hover tooltips, double-click detection, and search.
-
-**`index.html`** contains all HTML structure, CSS styles, and UI elements (search panel, legend, tooltip, help modal). Styles are inline in `<style>`, not in separate CSS files.
+- The main thread never parses GeoJSON. Decompression, parsing, and binary-bundle construction run in `src/dataWorker.js`, or in `src/dataProcessor.js` on the main thread when a blob Worker cannot start.
+- The worker is imported via `?worker&inline` so the release zip's single-file HTML works without extra assets.
+- The help modal renders `README.md` (imported with `?raw`, rendered by `marked`), so editing README changes the in-app help.
 
 ## Key Data Flow
 
-1. `App.loadAndShowFclass(fclass)` fetches per-fclass files from `public/osm_[fclass].geojson.gz` (four files: motorway, trunk, primary, secondary) as raw bytes with download progress, then hands them to `dataWorker.js`. The worker (or main-thread fallback) detects gzip magic bytes, decompresses, parses, and builds a binary bundle. The main thread never parses GeoJSON.
-2. `MapView.setTierBundle(fclass, bundle)` stores the bundle and renders via deck.gl `PathLayer`s in binary mode (flat coordinate array + `startIndices`, `_pathType: 'open'`, `positionFormat: 'XY'`). `PathLayer` (not `LineLayer`) is required for joint/cap rendering — independent per-segment quads look like fuzzy "caterpillars" on dense polylines; `jointRounded`/`capRounded` make them continuous. Three LOD stages: zoom < 8 uses coarse simplified geometry (~97% segment reduction), zoom 8–10.5 uses fine simplified geometry, zoom ≥ 10.5 renders full detail but only for grid cells intersecting the viewport. Both LOD layers stay resident with `visible` flags (avoids re-tessellation when crossing zoom thresholds); cell layers are created on demand. Within a cell, roads are stored as "runs" (maximal in-cell consecutive vertex sequences; a road crossing a cell boundary is split, duplicating the boundary vertex). LOD layers use absolute lng/lat (plain LNGLAT) — nationwide `LNGLAT_OFFSETS` is NOT usable here because the Web Mercator linearization error grows cubically with latitude distance from the origin (km-scale shifts in Hokkaido). Cell layers use cell-relative Float32 + `LNGLAT_OFFSETS`; cells are 2° lng × 0.5° lat (latitude kept small for the same reason — error at ±0.25° is ~0.2 m, sub-pixel at all zooms).
-3. Labels are precomputed in the worker as point candidates along LineStrings at ~0.05 degree intervals (packed arrays), then filtered per viewport using screen-pixel grid spacing (150px minimum), highlighted roads first, then by road importance.
-4. Search scans per-feature property arrays in-memory; highlight geometry is reconstructed from the quantized coordinate master into a yellow binary `LineLayer` (full 41k-feature highlight builds in ~200ms). Picking maps segment index → feature index → properties for tooltips and double-click search.
+- Roads use binary-mode `PathLayer` with `jointRounded`/`capRounded`. `LineLayer` draws each segment as an independent quad, which looks like fuzzy "caterpillars" on dense polylines.
+- Both LOD layers stay resident and are switched with `visible`. Recreating them at zoom thresholds causes re-tessellation.
+- LOD layers use absolute lng/lat (plain LNGLAT). A single nationwide origin with `LNGLAT_OFFSETS` shifts geometry by kilometers in Hokkaido, because the Web Mercator linearization error grows cubically with latitude distance from the origin.
+- Full-detail cell layers use cell-relative Float32 + `LNGLAT_OFFSETS`, with cells of 2° lng × 0.5° lat. The small latitude extent keeps the error at ±0.25° around 0.2 m (sub-pixel at all zooms), so do not enlarge cells in latitude.
+- Highlighting all 41k features of a search result takes about 200 ms.
 
 ## Road Styling
 
-Road styles are defined in `ROAD_STYLES`, `Z_ORDER`, and `ROAD_LAYERS` constants in MapView.js. The `fclass` property from OSM data drives both color/width and draw order. `ROAD_LAYERS` defines the per-tier layer array (draw order: secondary → primary → trunk → motorway). Legend items in index.html use `data-fclass` attributes and are styled programmatically from `ROAD_STYLES`.
+Legend items in `index.html` carry only `data-fclass`, and `src/main.js` colors them from `ROAD_STYLES` at runtime.
+Change colors in `ROAD_STYLES` only.
 
 ## Deployment (GitHub Pages shell + Cloudflare R2 data)
 
