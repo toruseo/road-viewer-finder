@@ -34,6 +34,12 @@ export const ROAD_STYLES = {
   primary:   { color: [25, 90, 50, 255], width: 3 },  // Green
   secondary: { color: [25, 90, 50, 255], width: 2 },  // Green, thinnest
 };
+// export const ROAD_STYLES = { //看板色に合わせたカラースキーム．TODO: 要調整
+//   motorway:  { color: [25, 128, 50, 255],  width: 6 },  // Green, thickest
+//   trunk:     { color: [50, 100, 220, 255], width: 4 },  // Blue
+//   primary:   { color: [128, 128, 128, 255], width: 3 },  // Gray
+//   secondary: { color: [128, 128, 128, 255], width: 2 },  // Gray, thinnest
+// };
 export const DEFAULT_ROAD_STYLE = { color: [128, 128, 128, 255], width: 1 };
 
 // Road layer definitions: array order = draw order (first = bottom, last = top)
@@ -84,9 +90,9 @@ const LABEL_FONT_FAMILY = '"Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto S
 // [下限, 上限]: 下限 <= zoom < 上限 のときだけ表示する。上限を設けない場合は Infinity
 const SHIELD_ZOOM_RANGE = {
   motorway:  [5, Infinity],
-  trunk:     [7, Infinity],
-  primary:   [9, Infinity],
-  secondary: [10, Infinity],
+  trunk:     [9, Infinity],
+  primary:   [11, Infinity],
+  secondary: [11, Infinity],
 };
 
 // --- 路線番号シールド（標識アイコン）の形状 ---
